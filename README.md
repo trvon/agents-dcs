@@ -45,6 +45,9 @@ research-agent-benchmark-report results/gpt120b.json results/qwen122b.json --out
 
 - Executor configs default to `temperature: 1.0`; critic and review configs default to `temperature: 0.0`.
 - Benchmark commands prime YAMS indexing by default, wait for post-ingest queues to settle, then run retrieval.
+- Benchmark priming now uses `yams add --sync` instead of repeated status polling, so the harness waits once instead of spamming CLI/status checks.
+- Model warmup now waits for repeated successful probes and at least `65535` tokens of ready context before long benchmark runs continue.
+- If the indexed repo fingerprint is unchanged and YAMS is already ready, benchmark priming skips the re-add/re-wait cycle.
 - Large local models should be benchmarked one at a time, then merged with `research-agent-benchmark-report`.
 
 ## Benchmarking

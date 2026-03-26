@@ -503,11 +503,13 @@ class ModelExecutor:
                     base_url=self.config.base_url,
                     api_key=self.config.api_key,
                     context_length=int(self.config.context_window),
+                    min_ready_context_length=65535,
                     keep_model_in_memory=True,
                     retries=2,
                     retry_backoff_s=max(1.0, backoff),
                     ready_timeout_s=wait_for,
                     ready_poll_s=max(1.0, backoff),
+                    required_successes=2,
                 )
                 continue
             except (TimeoutError, APIConnectionError, APITimeoutError) as e:

@@ -26,7 +26,9 @@ research-agent-benchmark-retrieval \
 Default behavior:
 
 - The command re-indexes the scoped repo with `yams add . --recursive ...` before benchmarking.
-- It waits for `yams status --json` to report ready and for post-ingest queues to drain.
+- It uses `yams add --sync` so indexing and extraction finish in one bounded wait instead of repeated status polling.
+- Model warmup waits for repeated successful probes and at least `65535` ready-context tokens before the suite continues.
+- If the repo fingerprint is unchanged and YAMS is already ready, priming skips the re-index step and does not add unnecessary settle time.
 - Pass `--no-prime-index` only when you intentionally want to reuse a pre-ingested dataset.
 
 Recommended settings:

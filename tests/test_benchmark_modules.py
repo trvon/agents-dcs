@@ -115,6 +115,12 @@ def test_coverage_preload_configs_deduplicates(monkeypatch: pytest.MonkeyPatch) 
     assert c1.context_window == 32768
 
 
+def test_coverage_disables_heavy_secondary_calls() -> None:
+    cfg = cov_bench._disable_heavy_secondary_calls(PipelineConfig())
+    assert cfg.use_dspy_faithfulness is False
+    assert cfg.no_ground_truth_mode is False
+
+
 @pytest.mark.asyncio
 async def test_coverage_run_suite_with_checkpoint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

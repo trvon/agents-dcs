@@ -184,11 +184,13 @@ class TieredRouter:
                 base_url=cfg.executor_model.base_url,
                 api_key=cfg.executor_model.api_key,
                 context_length=int(cfg.executor_model.context_window),
+                min_ready_context_length=65535,
                 keep_model_in_memory=True,
                 retries=int(self.policy.preload_retries),
                 retry_backoff_s=float(self.policy.preload_retry_backoff_s),
                 ready_timeout_s=max(300.0, float(cfg.executor_model.request_timeout_s or 600.0)),
                 ready_poll_s=max(1.0, float(self.policy.preload_retry_backoff_s)),
+                required_successes=2,
             )
             crit = cfg.critic_model
             if crit and crit.name != cfg.executor_model.name:
@@ -197,11 +199,13 @@ class TieredRouter:
                     base_url=crit.base_url,
                     api_key=crit.api_key,
                     context_length=int(crit.context_window),
+                    min_ready_context_length=65535,
                     keep_model_in_memory=True,
                     retries=int(self.policy.preload_retries),
                     retry_backoff_s=float(self.policy.preload_retry_backoff_s),
                     ready_timeout_s=max(300.0, float(crit.request_timeout_s or 600.0)),
                     ready_poll_s=max(1.0, float(self.policy.preload_retry_backoff_s)),
+                    required_successes=2,
                 )
         except Exception:
             pass

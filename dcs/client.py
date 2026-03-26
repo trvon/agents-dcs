@@ -14,6 +14,7 @@ import logging
 import os
 import re as _re
 import time
+from asyncio.subprocess import PIPE
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -450,6 +451,83 @@ class YAMSClient:
         return name in (self._tool_names or set())
 
     @staticmethod
+    def _maybe_path_like(text: str) -> str | None:
+        raw = (text or "").strip().strip("\"'")
+        if not raw:
+            return None
+        if "\n" in raw:
+            raw = raw.splitlines()[0].strip().strip("\"'")
+        if not (
+            "/" in raw
+            or raw.endswith(
+                (
+                    ".cpp",
+                    ".cc",
+                    ".cxx",
+                    ".c",
+                    ".h",
+                    ".hpp",
+                    ".py",
+                    ".rs",
+                    ".ts",
+                    ".js",
+                    ".go",
+                    ".java",
+                )
+            )
+        ):
+            return None
+        return raw
+
+    @staticmethod
+    def _normalize_search_source(path: str, snippet: str, title: str = "") -> str:
+        src = (path or "").strip()
+        if src and not _is_noise_source(src):
+            return src
+
+        for candidate in (snippet, title):
+            maybe = YAMSClient._maybe_path_like(candidate)
+            if maybe and not _is_noise_source(maybe):
+                return maybe
+        return src
+
+    async def _cli_json(self, argv: list[str], *, timeout_s: float | None = None) -> Any:
+        env = os.environ.copy()
+        if self._data_dir is not None:
+            env["YAMS_DATA_DIR"] = self._data_dir
+
+        proc = await asyncio.create_subprocess_exec(
+            self._yams_binary,
+            *argv,
+            stdout=PIPE,
+            stderr=PIPE,
+            cwd=self._cwd or None,
+            env=env,
+        )
+        timeout = self._request_timeout_s if timeout_s is None else float(timeout_s)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise TimeoutError(f"Timed out waiting for CLI response: {' '.join(argv)}")
+
+        if proc.returncode != 0:
+            detail = (
+                stderr.decode("utf-8", errors="replace").strip()
+                or stdout.decode("utf-8", errors="replace").strip()
+            )
+            raise YAMSProcessError(f"CLI command failed: {' '.join(argv)} ({detail})")
+
+        text = stdout.decode("utf-8", errors="replace").strip()
+        if not text:
+            return {}
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            raise YAMSProtocolError(f"CLI returned invalid JSON for {' '.join(argv)}: {e}") from e
+
+    @staticmethod
     def _get_str(mapping: dict[str, Any], key: str) -> str:
         val = mapping.get(key)
         return val if isinstance(val, str) else ""
@@ -460,6 +538,9 @@ class YAMSClient:
             return tool_result
 
         sc = tool_result.get("structuredContent")
+        if isinstance(sc, dict) and sc:
+            if any(k in sc for k in ("results", "matches", "documents", "paths", "ready", "steps")):
+                return sc
         if isinstance(sc, dict) and isinstance(sc.get("data"), (dict, list, str, int, float, bool)):
             return sc.get("data")
 
@@ -502,6 +583,7 @@ class YAMSClient:
                 chunk_id = json.dumps(r, ensure_ascii=True)
             snippet = YAMSClient._get_str(r, "snippet")
             title = YAMSClient._get_str(r, "title")
+            source = YAMSClient._normalize_search_source(path, snippet, title)
             meta = {k: v for k, v in r.items() if k not in {"snippet", "score"}}
 
             # Search anchor metadata (if MCP provides line/char spans).
@@ -527,13 +609,13 @@ class YAMSClient:
             if anchor_parts:
                 anchor = " [" + ", ".join(anchor_parts) + "]"
 
-            content: str = (snippet or title or path or chunk_id) + anchor
+            content: str = (snippet or title or source or path or chunk_id) + anchor
             score = float(r.get("score") or 0.0)
             if anchor_parts:
                 score = max(score, 0.55)
             out.append(
                 YAMSChunk(
-                    chunk_id=chunk_id, content=content, score=score, source=path, metadata=meta
+                    chunk_id=chunk_id, content=content, score=score, source=source, metadata=meta
                 )
             )
         return out
@@ -1182,6 +1264,27 @@ class YAMSClient:
                         return chunks
             except Exception as e:
                 last_err = e
+                try:
+                    cli_args = ["search", query, "--limit", str(limit), "--json"]
+                    if t:
+                        cli_args.extend(["--type", t])
+                    data = await self._cli_json(
+                        cli_args, timeout_s=max(30.0, self._request_timeout_s)
+                    )
+                    chunks = self._chunks_from_search_data(data)
+                    chunks = [
+                        c
+                        for c in chunks
+                        if not c.source or self._source_matches_filters(c.source, cwd=self._cwd)
+                    ]
+                    self._backfill_positional_scores(chunks)
+                    q = self._search_result_quality(chunks, query)
+                    candidates.append((q, f"cli:{t}", chunks))
+                    if not requested_type and t == "hybrid":
+                        if chunks and q >= fallback_quality_threshold:
+                            return chunks
+                except Exception:
+                    pass
                 continue
 
         if candidates:
@@ -1214,8 +1317,13 @@ class YAMSClient:
         if self._cwd and "cwd" not in kwargs:
             args["cwd"] = self._cwd
         args.update(kwargs)
-        tool_result = await self._call_tool("grep", args)
-        data = self._extract_tool_data(tool_result)
+        try:
+            tool_result = await self._call_tool("grep", args)
+            data = self._extract_tool_data(tool_result)
+        except Exception:
+            data = await self._cli_json(
+                ["grep", pat, "--json"], timeout_s=max(30.0, self._request_timeout_s)
+            )
         chunks = self._enrich_grep_results(
             data,
             pat,
@@ -1475,8 +1583,13 @@ class YAMSClient:
         raise YAMSProtocolError(f"add: unexpected response: {data}")
 
     async def status(self) -> dict[str, Any]:
-        tool_result = await self._call_tool("status", {})
-        data = self._extract_tool_data(tool_result)
+        try:
+            tool_result = await self._call_tool("status", {})
+            data = self._extract_tool_data(tool_result)
+        except Exception:
+            data = await self._cli_json(
+                ["status", "--json"], timeout_s=max(30.0, self._request_timeout_s)
+            )
         if isinstance(data, dict):
             return data
         return {"data": data}

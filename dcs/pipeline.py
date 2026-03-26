@@ -112,6 +112,9 @@ class DCSPipeline:
         kwargs["yams_binary"] = self.config.yams_binary
         kwargs["yams_data_dir"] = self.config.yams_data_dir
         kwargs["search_weights"] = weights
+        kwargs["request_timeout_s"] = max(
+            30.0, float(self.config.executor_model.request_timeout_s or 60.0)
+        )
         if self.config.yams_cwd:
             kwargs["cwd"] = self.config.yams_cwd
         return kwargs

@@ -414,7 +414,14 @@ def main() -> int:
         )
         post_ingest = status.get("post_ingest") if isinstance(status, dict) else {}
         queued = post_ingest.get("queued", 0) if isinstance(post_ingest, dict) else 0
-        console.print(f"YAMS ready; post_ingest queued={queued}")
+        prime_meta = status.get("_dcs_prime") if isinstance(status, dict) else {}
+        reason = prime_meta.get("reason", "ready") if isinstance(prime_meta, dict) else "ready"
+        skipped = (
+            bool(prime_meta.get("skipped_add", False)) if isinstance(prime_meta, dict) else False
+        )
+        console.print(
+            f"YAMS ready; post_ingest queued={queued} reason={reason} skipped_add={'yes' if skipped else 'no'}"
+        )
     exec_key = args.executor or defaults.get("executor", "gpt-oss-20b")
     critic_key = args.critic or defaults.get("critic", "qwen35-35b-a3b")
 

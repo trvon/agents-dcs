@@ -42,3 +42,30 @@ def test_parse_graph_query_builds_node_key_for_paths(tmp_path: Path) -> None:
     assert args["limit"] == 33
     assert "node_key" in args
     assert str(target.resolve()) in str(args["node_key"])
+
+
+def test_chunks_from_search_data_uses_snippet_path_when_result_path_is_artifact() -> None:
+    data = {
+        "results": [
+            {
+                "id": "1",
+                "path": "/repo/external/agent/results/checkpoint.json",
+                "snippet": "/repo/src/daemon/components/EmbeddingService.cpp",
+                "score": 0.9,
+            }
+        ]
+    }
+    chunks = YAMSClient._chunks_from_search_data(data)
+    assert len(chunks) == 1
+    assert chunks[0].source == "/repo/src/daemon/components/EmbeddingService.cpp"
+
+
+def test_extract_tool_data_accepts_structured_content_without_data_wrapper() -> None:
+    payload = {
+        "structuredContent": {
+            "results": [{"path": "/repo/src/foo.cpp", "snippet": "foo", "score": 0.8}]
+        }
+    }
+    extracted = YAMSClient._extract_tool_data(payload)
+    assert isinstance(extracted, dict)
+    assert "results" in extracted

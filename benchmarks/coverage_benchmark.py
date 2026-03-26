@@ -130,11 +130,13 @@ def _preload_configs(
             base_url=cfg.base_url,
             api_key=cfg.api_key,
             context_length=requested_ctx,
+            min_ready_context_length=65535,
             keep_model_in_memory=True,
             retries=retries,
             retry_backoff_s=retry_backoff_s,
             ready_timeout_s=max(300.0, float(cfg.request_timeout_s or 600.0)),
             ready_poll_s=max(1.0, float(retry_backoff_s)),
+            required_successes=2,
         )
         actual_ctx = get_context_length(cfg.name) or int(cfg.context_window)
         try:
@@ -148,6 +150,12 @@ def _preload_configs(
             f"{status}: {cfg.name} (requested_ctx={requested_ctx} actual_ctx={int(actual_ctx)})"
             "[/dim]"
         )
+
+
+def _disable_heavy_secondary_calls(config: PipelineConfig) -> PipelineConfig:
+    config.use_dspy_faithfulness = False
+    config.no_ground_truth_mode = False
+    return config
 
 
 async def _run_suite(
@@ -405,7 +413,14 @@ def main() -> int:
         )
         post_ingest = status.get("post_ingest") if isinstance(status, dict) else {}
         queued = post_ingest.get("queued", 0) if isinstance(post_ingest, dict) else 0
-        console.print(f"YAMS ready; post_ingest queued={queued}")
+        prime_meta = status.get("_dcs_prime") if isinstance(status, dict) else {}
+        reason = prime_meta.get("reason", "ready") if isinstance(prime_meta, dict) else "ready"
+        skipped = (
+            bool(prime_meta.get("skipped_add", False)) if isinstance(prime_meta, dict) else False
+        )
+        console.print(
+            f"YAMS ready; post_ingest queued={queued} reason={reason} skipped_add={'yes' if skipped else 'no'}"
+        )
 
     executors = [m for m in args.models.split(",") if m.strip()]
     if not executors:
@@ -449,6 +464,7 @@ def main() -> int:
             enable_task_seeding=bool(args.task_seeding),
             yams_cwd=args.yams_cwd,
         )
+        config = _disable_heavy_secondary_calls(config)
 
         fallback_configs: list[PipelineConfig] = []
         if fallback_keys:
@@ -460,18 +476,20 @@ def main() -> int:
                     else _build_model_config(models_cfg, fallback_critic_key)
                 )
                 fallback_configs.append(
-                    PipelineConfig(
-                        executor_model=fb_exec,
-                        critic_model=fb_crit,
-                        context_budget=args.context_budget,
-                        max_iterations=args.max_iterations,
-                        quality_threshold=args.quality_threshold,
-                        convergence_delta=args.convergence_delta,
-                        context_profile=str(args.context_profile),
-                        no_ground_truth_mode=bool(args.ground_truth_mode),
-                        use_dspy_faithfulness=bool(args.dspy_faithfulness),
-                        enable_task_seeding=bool(args.task_seeding),
-                        yams_cwd=args.yams_cwd,
+                    _disable_heavy_secondary_calls(
+                        PipelineConfig(
+                            executor_model=fb_exec,
+                            critic_model=fb_crit,
+                            context_budget=args.context_budget,
+                            max_iterations=args.max_iterations,
+                            quality_threshold=args.quality_threshold,
+                            convergence_delta=args.convergence_delta,
+                            context_profile=str(args.context_profile),
+                            no_ground_truth_mode=bool(args.ground_truth_mode),
+                            use_dspy_faithfulness=bool(args.dspy_faithfulness),
+                            enable_task_seeding=bool(args.task_seeding),
+                            yams_cwd=args.yams_cwd,
+                        )
                     )
                 )
 
