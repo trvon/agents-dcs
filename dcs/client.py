@@ -1152,10 +1152,12 @@ class YAMSClient:
 
         args.update(kwargs)
 
-        # Prefer hybrid by default; fallback to keyword if empty/error.
+        # Prefer hybrid by default; only fallback to keyword when hybrid has
+        # no useful coverage. This avoids doubling MCP traffic on every search.
         requested_type = str(args.get("type") or "").strip().lower()
         tried_types: list[str] = [requested_type] if requested_type else ["hybrid", "keyword"]
         last_err: Exception | None = None
+        fallback_quality_threshold = 0.30
 
         candidates: list[tuple[float, str, list[YAMSChunk]]] = []
         for t in tried_types:
@@ -1174,6 +1176,10 @@ class YAMSClient:
                 self._backfill_positional_scores(chunks)
                 q = self._search_result_quality(chunks, query)
                 candidates.append((q, t, chunks))
+
+                if not requested_type and t == "hybrid":
+                    if chunks and q >= fallback_quality_threshold:
+                        return chunks
             except Exception as e:
                 last_err = e
                 continue

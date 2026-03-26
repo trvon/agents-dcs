@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dcs.executor import _is_model_unloaded_error, _parse_context_overflow
+from dcs.executor import ModelExecutor, _is_model_unloaded_error, _parse_context_overflow
+from dcs.types import ModelConfig
 
 
 def test_parse_context_overflow_with_numbers() -> None:
@@ -29,3 +30,12 @@ def test_is_model_unloaded_error_ignores_other_errors() -> None:
     assert not _is_model_unloaded_error(
         "Error code: 400 - {'error': 'tokens to keep from the initial prompt is greater than context length'}"
     )
+
+
+def test_model_backoff_grows_with_attempts() -> None:
+    ex = ModelExecutor.__new__(ModelExecutor)
+    ex.config = ModelConfig(name="demo", retry_backoff_s=2.0)
+    first = ex._compute_retry_backoff(0)
+    second = ex._compute_retry_backoff(1)
+    assert first == 2.0
+    assert second == 4.0

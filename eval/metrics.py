@@ -146,4 +146,11 @@ def evaluate_task(task: EvalTask, result: PipelineResult) -> dict[str, float]:
 
     metrics["iterations"] = float(len(result.iterations or []))
     metrics["total_latency_ms"] = float(result.total_latency_ms or 0.0)
+
+    plan_review = getattr(result, "plan_review", None)
+    if plan_review is not None:
+        metrics["plan_coverage"] = float(getattr(plan_review, "coverage_score", 0.0) or 0.0)
+        metrics["plan_executed_well"] = (
+            1.0 if bool(getattr(plan_review, "executed_well", False)) else 0.0
+        )
     return metrics

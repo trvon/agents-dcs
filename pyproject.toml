@@ -44,6 +44,7 @@ dcs = "dcs.cli:main"
 research-agent = "dcs.cli:main"
 research-agent-benchmark-coverage = "benchmarks.coverage_benchmark:main"
 research-agent-benchmark-retrieval = "benchmarks.retrieval_benchmark:main"
+research-agent-benchmark-report = "benchmarks.report_benchmark:main"
 
 [dependency-groups]
 dev = [

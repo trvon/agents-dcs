@@ -17,6 +17,7 @@ from rich.table import Table
 
 from dcs.client import YAMSClient
 from dcs.decomposer import TaskDecomposer
+from dcs.indexing import prime_yams_index
 from dcs.planner import QueryPlanner
 from dcs.types import (
     EvalTask,
@@ -61,7 +62,7 @@ def _build_model_config(models_cfg: dict[str, Any], key: str) -> ModelConfig:
         context_window=int(m.get("context_window") or 8192),
         max_output_tokens=int(m.get("max_output_tokens") or 2048),
         temperature=float(m.get("temperature") or 0.7),
-        request_timeout_s=float(m.get("request_timeout_s") or 180.0),
+        request_timeout_s=float(m.get("request_timeout_s") or 600.0),
         max_retries=int(m.get("max_retries") or 2),
         retry_backoff_s=float(m.get("retry_backoff_s") or 2.0),
     )
@@ -387,12 +388,33 @@ def main() -> int:
         default=0.0,
         help="Temperature for model decomposition mode",
     )
+    parser.add_argument(
+        "--prime-index",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Re-index repo content and wait for ingestion to settle before retrieval benchmark",
+    )
+    parser.add_argument(
+        "--prime-timeout-s",
+        type=float,
+        default=900.0,
+        help="Timeout for pre-benchmark indexing wait",
+    )
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
     console = Console()
     models_cfg = _load_models_config(Path(args.models_config))
     defaults = models_cfg.get("defaults") or {}
+    if args.prime_index:
+        console.print(f"Priming YAMS index under {args.yams_cwd} ...")
+        status = prime_yams_index(
+            root=str(args.yams_cwd),
+            timeout_s=float(args.prime_timeout_s),
+        )
+        post_ingest = status.get("post_ingest") if isinstance(status, dict) else {}
+        queued = post_ingest.get("queued", 0) if isinstance(post_ingest, dict) else 0
+        console.print(f"YAMS ready; post_ingest queued={queued}")
     exec_key = args.executor or defaults.get("executor", "gpt-oss-20b")
     critic_key = args.critic or defaults.get("critic", "qwen35-35b-a3b")
 
@@ -467,6 +489,7 @@ def main() -> int:
             "decompose_mode": str(args.decompose_mode),
             "task_seeding": bool(args.task_seeding),
             "decomposer_temperature": float(args.decomposer_temperature),
+            "prime_index": bool(args.prime_index),
             "tag_match": str(args.tag_match),
         },
         "summary": summary,

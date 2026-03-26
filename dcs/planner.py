@@ -27,6 +27,47 @@ class YAMSClientLike(Protocol):
 
 _PATH_RE = re.compile(r"(?P<path>(?:[A-Za-z]:\\)?(?:\.?\.?/)?[\w.\-~/]+(?:/[\w.\-]+)+)")
 _IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
+_QUERY_STOP_TERMS = {
+    "path",
+    "include",
+    "exclude",
+    "depth",
+    "limit",
+    "file",
+    "code",
+    "class",
+    "method",
+    "function",
+    "implementation",
+    "details",
+    "describe",
+    "explain",
+    "list",
+    "show",
+}
+_PATH_STOP_TERMS = {
+    "repo",
+    "src",
+    "include",
+    "lib",
+    "tests",
+    "test",
+    "docs",
+    "doc",
+    "benchmarks",
+    "benchmark",
+    "yams",
+    "cpp",
+    "hpp",
+    "h",
+    "cc",
+    "cxx",
+    "py",
+    "md",
+    "json",
+    "yaml",
+    "yml",
+}
 
 
 def _spec_key(spec: QuerySpec) -> tuple[str, str]:
@@ -57,8 +98,9 @@ def _is_noise_source(path: str) -> bool:
 class QueryPlanner:
     """Maps QuerySpecs to concrete YAMS executions (including expansions)."""
 
-    def __init__(self, yams: YAMSClientLike):
+    def __init__(self, yams: YAMSClientLike, max_concurrency: int = 0):
         self._yams = yams
+        self._max_concurrency = max(0, int(max_concurrency))
 
     async def execute(
         self, specs: list[QuerySpec], *, allow_adaptive: bool = True
@@ -123,7 +165,18 @@ class QueryPlanner:
     async def _execute_specs_batch(self, specs: list[QuerySpec]) -> list[YAMSQueryResult]:
         if not specs:
             return []
-        tasks = [self._timed_execute_spec(s) for s in specs]
+
+        if self._max_concurrency <= 0 or self._max_concurrency >= len(specs):
+            tasks = [self._timed_execute_spec(s) for s in specs]
+            return await asyncio.gather(*tasks)
+
+        sem = asyncio.Semaphore(self._max_concurrency)
+
+        async def run_one(spec: QuerySpec) -> YAMSQueryResult:
+            async with sem:
+                return await self._timed_execute_spec(spec)
+
+        tasks = [run_one(s) for s in specs]
         return await asyncio.gather(*tasks)
 
     def _partition_specs(
@@ -148,7 +201,7 @@ class QueryPlanner:
 
     def _graph_fanout_from_results(self, results: list[YAMSQueryResult]) -> list[QuerySpec]:
         out: list[QuerySpec] = []
-        max_graph_specs = 6
+        max_graph_specs = 4
 
         for res in results:
             if len(out) >= max_graph_specs:
@@ -156,25 +209,18 @@ class QueryPlanner:
             if res.spec.query_type not in {QueryType.SEMANTIC, QueryType.LIST}:
                 continue
 
-            ranked = sorted(res.chunks or [], key=lambda c: float(c.score or 0.0), reverse=True)
-            emitted = 0
-            for c in ranked:
-                if len(out) >= max_graph_specs or emitted >= 2:
+            validated = self._validated_paths_from_results([res], min_confidence=0.58, per_result=1)
+            for src in validated:
+                if len(out) >= max_graph_specs:
                     break
-                src = self._path_from_chunk(c)
-                if not src or _is_noise_source(src):
-                    continue
-                if "/" not in src and "\\" not in src:
-                    continue
                 out.append(
                     QuerySpec(
-                        query=f"{src} depth:1 limit:40",
+                        query=f"{src} depth:1 limit:25",
                         query_type=QueryType.GRAPH,
                         importance=max(0.5, float(res.spec.importance) - 0.1),
-                        reason="stage: graph fanout from search",
+                        reason="stage: graph fanout from validated search anchor",
                     )
                 )
-                emitted += 1
 
         return out
 
@@ -186,7 +232,7 @@ class QueryPlanner:
         if not specs:
             return []
 
-        graph_paths = self._top_graph_paths(graph_results, limit=10)
+        graph_paths = self._top_graph_paths(graph_results, limit=8)
         if not graph_paths:
             return specs
 
@@ -196,7 +242,7 @@ class QueryPlanner:
                 q = (spec.query or "").strip()
                 if not q or "path:" in q:
                     continue
-                for p in self._select_paths_for_query(q, graph_paths, max_paths=2):
+                for p in self._select_paths_for_query(q, graph_paths, max_paths=1):
                     out.append(
                         QuerySpec(
                             query=f"{q} path:{p}",
@@ -211,7 +257,7 @@ class QueryPlanner:
                     continue
                 if "/" in q or "\\" in q:
                     continue
-                for p in self._select_paths_for_get(q, graph_paths, max_paths=3):
+                for p in self._select_paths_for_get(q, graph_paths, max_paths=2):
                     out.append(
                         QuerySpec(
                             query=p,
@@ -427,16 +473,109 @@ class QueryPlanner:
                     return normalized
         return None
 
+    @staticmethod
+    def _query_terms(text: str) -> list[str]:
+        terms: list[str] = []
+        for token in re.findall(r"[A-Za-z0-9_\-]+", text or ""):
+            t = token.lower()
+            if len(t) < 3 or t in _QUERY_STOP_TERMS:
+                continue
+            if t not in terms:
+                terms.append(t)
+        return terms
+
+    @staticmethod
+    def _path_parts(path: str) -> list[str]:
+        parts: list[str] = []
+        for token in re.split(r"[/\\._\-]+", path or ""):
+            t = token.lower().strip()
+            if len(t) < 2:
+                continue
+            if t in _PATH_STOP_TERMS:
+                continue
+            parts.append(t)
+        return parts
+
+    def _anchor_confidence(self, spec: QuerySpec, chunk: YAMSChunk) -> float:
+        path = self._path_from_chunk(chunk)
+        if not path or _is_noise_source(path):
+            return 0.0
+
+        score = float(chunk.score or 0.0)
+        path_parts = self._path_parts(path)
+        q_terms = self._query_terms(spec.query)
+        if not q_terms:
+            return max(0.0, min(1.0, score))
+
+        overlaps = sum(1 for term in q_terms if term in path_parts or term in path.lower())
+        text_l = (chunk.content or "").lower()
+        text_hits = sum(1 for term in q_terms if term in text_l)
+        basename = self._basename(path).lower()
+
+        conf = 0.50 * score
+        if overlaps:
+            conf += min(0.30, 0.10 * overlaps)
+        if text_hits:
+            conf += min(0.15, 0.05 * text_hits)
+        if any(term in basename for term in q_terms):
+            conf += 0.08
+        if "." in basename:
+            conf += 0.05
+        if spec.query_type == QueryType.GET:
+            conf += 0.10
+        if spec.query_type == QueryType.GREP and "path:" in (spec.query or ""):
+            conf += 0.10
+        return max(0.0, min(1.0, conf))
+
+    def _validated_paths_from_results(
+        self,
+        results: list[YAMSQueryResult],
+        *,
+        min_confidence: float,
+        per_result: int,
+    ) -> list[str]:
+        scored: dict[str, float] = {}
+        for res in results:
+            ranked = sorted(
+                list(res.chunks or []),
+                key=lambda c: self._anchor_confidence(res.spec, c),
+                reverse=True,
+            )
+            emitted = 0
+            for chunk in ranked:
+                if emitted >= per_result:
+                    break
+                path = self._path_from_chunk(chunk)
+                if not path:
+                    continue
+                conf = self._anchor_confidence(res.spec, chunk)
+                if conf < float(min_confidence):
+                    continue
+                scored[path] = max(scored.get(path, 0.0), conf)
+                emitted += 1
+
+        ordered = sorted(scored.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
+        return [path for path, _ in ordered]
+
     def _top_graph_paths(self, graph_results: list[YAMSQueryResult], limit: int = 10) -> list[str]:
         scored: dict[str, float] = {}
         for res in graph_results:
+            anchor_hint = (res.spec.query or "").split(" depth:", 1)[0].strip()
+            anchor_parts = set(self._path_parts(anchor_hint))
             for c in res.chunks or []:
                 p = self._path_from_chunk(c)
                 if not p:
                     continue
                 if _is_noise_source(p):
                     continue
-                scored[p] = max(scored.get(p, 0.0), float(c.score or 0.0))
+                path_parts = set(self._path_parts(p))
+                overlap = len(anchor_parts.intersection(path_parts)) if anchor_parts else 0
+                score = float(c.score or 0.0) + min(0.18, 0.06 * overlap)
+                if anchor_hint and p == anchor_hint:
+                    score -= 0.05
+                if anchor_parts and overlap == 0:
+                    score *= 0.75
+                scored[p] = max(scored.get(p, 0.0), score)
 
         ordered = sorted(scored.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
         return [p for p, _ in ordered[: max(1, int(limit))]]
@@ -569,7 +708,7 @@ class QueryPlanner:
 
     def _adaptive_followups(self, results: list[YAMSQueryResult]) -> list[QuerySpec]:
         follow: list[QuerySpec] = []
-        max_followups = 8
+        max_followups = 5
 
         for res in results:
             if len(follow) >= max_followups:
@@ -663,16 +802,18 @@ class QueryPlanner:
                         continue
                     if "/" not in src and "\\" not in src:
                         continue
+                    if self._anchor_confidence(res.spec, c) < 0.55:
+                        continue
                     follow.append(
                         QuerySpec(
-                            query=f"{src} depth:1 limit:40",
+                            query=f"{src} depth:1 limit:25",
                             query_type=QueryType.GRAPH,
                             importance=max(0.45, res.spec.importance - 0.15),
-                            reason="adaptive: file anchor -> graph expansion",
+                            reason="adaptive: validated file anchor -> graph expansion",
                         )
                     )
                     emitted += 1
-                    if emitted >= 2 or len(follow) >= max_followups:
+                    if emitted >= 1 or len(follow) >= max_followups:
                         break
 
         return follow

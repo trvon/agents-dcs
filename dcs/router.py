@@ -187,7 +187,7 @@ class TieredRouter:
                 keep_model_in_memory=True,
                 retries=int(self.policy.preload_retries),
                 retry_backoff_s=float(self.policy.preload_retry_backoff_s),
-                ready_timeout_s=max(90.0, float(self.policy.preload_retries) * 20.0),
+                ready_timeout_s=max(300.0, float(cfg.executor_model.request_timeout_s or 600.0)),
                 ready_poll_s=max(1.0, float(self.policy.preload_retry_backoff_s)),
             )
             crit = cfg.critic_model
@@ -200,7 +200,7 @@ class TieredRouter:
                     keep_model_in_memory=True,
                     retries=int(self.policy.preload_retries),
                     retry_backoff_s=float(self.policy.preload_retry_backoff_s),
-                    ready_timeout_s=max(90.0, float(self.policy.preload_retries) * 20.0),
+                    ready_timeout_s=max(300.0, float(crit.request_timeout_s or 600.0)),
                     ready_poll_s=max(1.0, float(self.policy.preload_retry_backoff_s)),
                 )
         except Exception:

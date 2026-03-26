@@ -113,10 +113,25 @@ class EvalRunner:
                 pr = await pipe.run_vanilla(task.description)
             metrics = evaluate_task(task, pr)
             passed = self._decide_pass(task, metrics)
-            return EvalResult(task_id=task.id, pipeline_result=pr, metrics=metrics, passed=passed)
+            return EvalResult(
+                task_id=task.id,
+                pipeline_result=pr,
+                metrics=metrics,
+                passed=passed,
+                task_type=task.task_type.value,
+                tags=list(task.tags or []),
+                repeat_index=1,
+            )
         except Exception as e:
             return EvalResult(
-                task_id=task.id, pipeline_result=None, metrics={}, passed=False, error=str(e)
+                task_id=task.id,
+                pipeline_result=None,
+                metrics={},
+                passed=False,
+                error=str(e),
+                task_type=task.task_type.value,
+                tags=list(task.tags or []),
+                repeat_index=1,
             )
 
     async def run_suite(self, tasks: list[EvalTask], scaffolded: bool = True) -> list[EvalResult]:

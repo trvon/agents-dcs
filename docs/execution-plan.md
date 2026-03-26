@@ -46,3 +46,14 @@ Quick wins:
    - cost/success
    - retrieval coverage depth
 3. Tune thresholds and retry/bias factors based on results.
+
+## Phase 6: Ingest-First Retrieval + Plan Review
+1. Prime YAMS indexing before retrieval and benchmark runs.
+2. Validate search anchors before expanding graph traversal.
+3. Use graph only to refine trusted anchors into better GET/GREP targets.
+4. Add post-execution plan review as a separate evaluation axis.
+
+Acceptance:
+- Retrieval benchmarks run on current ingested repo state.
+- Graph expansion improves authoritative file targeting instead of inflating context.
+- Plan review produces actionable gaps, tests, and follow-up advice.

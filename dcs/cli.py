@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ from rich.table import Table
 
 from dcs.executor import ModelExecutor
 from dcs.pipeline import DCSPipeline
+from dcs.plan_review import PlanReviewer
 from dcs.types import ModelConfig, PipelineConfig, TaskType
 
 
@@ -45,7 +48,7 @@ def _load_models(config_dir: Path) -> tuple[ModelConfig, ModelConfig | None]:
             max_output_tokens=int(entry.get("max_output_tokens") or 1024),
             temperature=float(entry.get("temperature") or 0.7),
             system_suffix=str(entry.get("system_suffix") or ""),
-            request_timeout_s=float(entry.get("request_timeout_s") or 120.0),
+            request_timeout_s=float(entry.get("request_timeout_s") or 600.0),
             max_retries=int(entry.get("max_retries") or 2),
             retry_backoff_s=float(entry.get("retry_backoff_s") or 2.0),
         )
@@ -93,6 +96,26 @@ def _apply_runtime_overrides(args: argparse.Namespace, cfg: PipelineConfig) -> P
     if profile:
         cfg.context_profile = str(profile)
     return cfg
+
+
+def _read_optional_text(path: str | None) -> str:
+    if not path:
+        return ""
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        return ""
+    return p.read_text(encoding="utf-8")
+
+
+def _split_changed_files(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    out: list[str] = []
+    for item in str(raw).split(","):
+        s = item.strip()
+        if s and s not in out:
+            out.append(s)
+    return out
 
 
 def _init_yams_client(cfg: PipelineConfig):
@@ -157,6 +180,50 @@ async def _cmd_compare(args: argparse.Namespace, cfg: PipelineConfig, console: C
         console.print(f"No tasks found in {task_dir}")
         return 1
     await run_comparison_report(runner, tasks)
+    return 0
+
+
+async def _cmd_review(args: argparse.Namespace, cfg: PipelineConfig, console: Console) -> int:
+    plan = _read_optional_text(getattr(args, "plan_file", None))
+    if not plan:
+        plan = str(getattr(args, "plan", "") or "").strip()
+    if not plan:
+        console.print("Plan review requires --plan or --plan-file")
+        return 2
+
+    from dcs.types import PlanReviewInput
+
+    review_input = PlanReviewInput(
+        plan=plan,
+        task=str(getattr(args, "task", "") or "").strip(),
+        diff_text=_read_optional_text(getattr(args, "diff_file", None)),
+        change_summary=_read_optional_text(getattr(args, "change_summary_file", None))
+        or str(getattr(args, "change_summary", "") or "").strip(),
+        execution_summary=_read_optional_text(getattr(args, "execution_summary_file", None))
+        or str(getattr(args, "execution_summary", "") or "").strip(),
+        changed_files=_split_changed_files(getattr(args, "changed_files", None)),
+    )
+
+    reviewer = PlanReviewer(cfg)
+    result = await reviewer.review(review_input)
+
+    console.rule("Plan Review")
+    console.print(f"Coverage: {result.coverage_score:.2f}")
+    console.print(f"Executed well: {'yes' if result.executed_well else 'no'}")
+    if result.summary:
+        console.print(result.summary)
+    if result.gaps:
+        console.print("Gaps:")
+        for gap in result.gaps:
+            console.print(f"- {gap}")
+    if result.suggested_tests:
+        console.print("Suggested tests:")
+        for test in result.suggested_tests:
+            console.print(f"- {test}")
+
+    if getattr(args, "json_out", None):
+        Path(args.json_out).write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
+        console.print(f"Wrote plan review to {args.json_out}")
     return 0
 
 
@@ -261,6 +328,43 @@ def _build_parser(default_task_dir: Path) -> argparse.ArgumentParser:
         help="Context budget profile",
     )
 
+    reviewp = sub.add_parser("review", help="review whether changes satisfied a plan")
+    reviewp.add_argument("--task", type=str, default="", help="task description")
+    reviewp.add_argument("--plan", type=str, default="", help="inline plan text")
+    reviewp.add_argument("--plan-file", type=str, default=None, help="path to plan text file")
+    reviewp.add_argument("--diff-file", type=str, default=None, help="path to unified diff file")
+    reviewp.add_argument(
+        "--change-summary",
+        type=str,
+        default="",
+        help="inline summary of code changes",
+    )
+    reviewp.add_argument(
+        "--change-summary-file",
+        type=str,
+        default=None,
+        help="path to change summary file",
+    )
+    reviewp.add_argument(
+        "--execution-summary",
+        type=str,
+        default="",
+        help="inline executor summary/output",
+    )
+    reviewp.add_argument(
+        "--execution-summary-file",
+        type=str,
+        default=None,
+        help="path to execution summary file",
+    )
+    reviewp.add_argument(
+        "--changed-files",
+        type=str,
+        default="",
+        help="comma-separated changed files",
+    )
+    reviewp.add_argument("--json-out", type=str, default=None, help="write JSON result to path")
+
     sub.add_parser("status", help="check YAMS + model connectivity")
     return p
 
@@ -294,6 +398,8 @@ def main() -> None:
             return await _cmd_eval(args, cfg, console)
         if args.cmd == "compare":
             return await _cmd_compare(args, cfg, console)
+        if args.cmd == "review":
+            return await _cmd_review(args, cfg, console)
         if args.cmd == "status":
             return await _cmd_status(args, cfg, console)
         console.print(f"Unknown command: {args.cmd}")

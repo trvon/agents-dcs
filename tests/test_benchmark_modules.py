@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from benchmarks import coverage_benchmark as cov_bench
+from benchmarks import report_benchmark as report_bench
 from benchmarks import retrieval_benchmark as ret_bench
 from dcs.types import (
     ContextBlock,
@@ -227,3 +228,24 @@ def test_retrieval_helpers_and_summary() -> None:
     s = ret_bench._summary(rows)
     assert s["file_hit_at_1"] == 1.0
     assert s["retrieval_latency_ms"] == 10.0
+
+
+def test_report_benchmark_summarizes_and_compares() -> None:
+    rows = [
+        {
+            "model": "gpt-oss-120b-executor",
+            "task_id": "t1",
+            "passed": True,
+            "metrics": {"quality_score": 0.9, "total_latency_ms": 100.0},
+        },
+        {
+            "model": "qwen-122b-executor",
+            "task_id": "t1",
+            "passed": False,
+            "metrics": {"quality_score": 0.7, "total_latency_ms": 80.0},
+        },
+    ]
+    summary = report_bench.summarize_models(rows)
+    comparison = report_bench.compare_models(rows)
+    assert summary["gpt-oss-120b-executor"]["pass_rate_mean"] == 1.0
+    assert comparison["wins"]["gpt-oss-120b-executor"] == 1

@@ -12,6 +12,7 @@ import yaml
 from rich.console import Console
 from rich.table import Table
 
+from dcs.indexing import prime_yams_index
 from dcs.lmstudio_context import get_context_length, preload_model
 from dcs.pipeline import DCSPipeline
 from dcs.router import RoutingPolicy, TieredRouter
@@ -61,7 +62,7 @@ def _build_model_config(models_cfg: dict[str, Any], key: str) -> ModelConfig:
         max_output_tokens=int(spec.get("max_output_tokens", 2048)),
         temperature=float(spec.get("temperature", 0.7)),
         system_suffix=str(suffix),
-        request_timeout_s=float(spec.get("request_timeout_s", 120.0)),
+        request_timeout_s=float(spec.get("request_timeout_s", 600.0)),
         max_retries=int(spec.get("max_retries", 2)),
         retry_backoff_s=float(spec.get("retry_backoff_s", 2.0)),
     )
@@ -132,7 +133,7 @@ def _preload_configs(
             keep_model_in_memory=True,
             retries=retries,
             retry_backoff_s=retry_backoff_s,
-            ready_timeout_s=max(90.0, float(retries) * max(1.0, float(retry_backoff_s)) * 10.0),
+            ready_timeout_s=max(300.0, float(cfg.request_timeout_s or 600.0)),
             ready_poll_s=max(1.0, float(retry_backoff_s)),
         )
         actual_ctx = get_context_length(cfg.name) or int(cfg.context_window)
@@ -250,6 +251,9 @@ def _serialize_results(results: list[EvalResult]) -> list[dict[str, Any]]:
     for r in results:
         payload: dict[str, Any] = {
             "task_id": r.task_id,
+            "task_type": r.task_type,
+            "tags": list(r.tags or []),
+            "repeat_index": int(r.repeat_index or 1),
             "passed": r.passed,
             "metrics": r.metrics,
             "error": r.error,
@@ -293,6 +297,9 @@ def _result_from_dict(d: dict[str, Any]) -> EvalResult:
         metrics=d.get("metrics") or {},
         passed=bool(d.get("passed", False)),
         error=d.get("error"),
+        task_type=str(d.get("task_type", "") or ""),
+        tags=[str(x) for x in (d.get("tags") or []) if x is not None],
+        repeat_index=int(d.get("repeat_index") or 1),
     )
 
 
@@ -372,11 +379,33 @@ def main() -> int:
         default=2.0,
         help="Backoff seconds between preload retries",
     )
+    parser.add_argument(
+        "--prime-index",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Re-index repo content and wait for ingestion to settle before running coverage suite",
+    )
+    parser.add_argument(
+        "--prime-timeout-s",
+        type=float,
+        default=900.0,
+        help="Timeout for pre-benchmark indexing wait",
+    )
     args = parser.parse_args()
 
     console = Console()
     models_cfg = _load_models_config(Path(args.models_config))
     defaults = models_cfg.get("defaults") or {}
+
+    if args.prime_index:
+        console.print(f"Priming YAMS index under {args.yams_cwd} ...")
+        status = prime_yams_index(
+            root=str(args.yams_cwd),
+            timeout_s=float(args.prime_timeout_s),
+        )
+        post_ingest = status.get("post_ingest") if isinstance(status, dict) else {}
+        queued = post_ingest.get("queued", 0) if isinstance(post_ingest, dict) else 0
+        console.print(f"YAMS ready; post_ingest queued={queued}")
 
     executors = [m for m in args.models.split(",") if m.strip()]
     if not executors:
@@ -481,6 +510,7 @@ def main() -> int:
             "task_seeding": bool(args.task_seeding),
             "fallback_threshold": args.fallback_threshold,
             "preload_models": bool(args.preload_models),
+            "prime_index": bool(args.prime_index),
         }
         ckpt_key = _checkpoint_key(exec_key, checkpoint_payload)
 

@@ -96,7 +96,7 @@ def preload_model(
     retries: int = 3,
     retry_backoff_s: float = 2.0,
     max_tokens: int = 8,
-    ready_timeout_s: float = 120.0,
+    ready_timeout_s: float = 600.0,
     ready_poll_s: float = 2.0,
 ) -> bool:
     """Best-effort model preload + warmup through LM Studio.
@@ -159,7 +159,7 @@ def preload_models(
     retry_backoff_s: float = 2.0,
     context_length: int | None = None,
     keep_model_in_memory: bool = True,
-    ready_timeout_s: float = 120.0,
+    ready_timeout_s: float = 600.0,
     ready_poll_s: float = 2.0,
 ) -> dict[str, bool]:
     status: dict[str, bool] = {}

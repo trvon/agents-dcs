@@ -177,13 +177,45 @@ def format_context_prompt(context: ContextBlock) -> str:
 class ModelExecutor:
     """Async model executor backed by an OpenAI-compatible API."""
 
+    _model_backoff_until: dict[tuple[str, str], float] = {}
+
     def __init__(self, config: ModelConfig):
         self.config = config
         self.client = AsyncOpenAI(
             base_url=config.base_url,
             api_key=config.api_key,
-            timeout=float(config.request_timeout_s or 60.0),
+            timeout=float(config.request_timeout_s or 600.0),
         )
+
+    def _backoff_key(self, model_name: str) -> tuple[str, str]:
+        return (str(self.config.base_url or ""), str(model_name or self.config.name or ""))
+
+    def _compute_retry_backoff(self, attempt: int, *, multiplier: float = 1.0) -> float:
+        base = max(1.0, float(self.config.retry_backoff_s or 0.0))
+        return max(1.0, base * max(1.0, float(multiplier)) * (2 ** max(0, int(attempt))))
+
+    async def _respect_model_backoff(self, model_name: str) -> None:
+        key = self._backoff_key(model_name)
+        until = float(self._model_backoff_until.get(key, 0.0) or 0.0)
+        remaining = until - time.monotonic()
+        if remaining > 0:
+            logger.info("Waiting %.1fs before retrying model %s", remaining, model_name)
+            await asyncio.sleep(remaining)
+
+    def _schedule_model_backoff(
+        self,
+        model_name: str,
+        *,
+        attempt: int,
+        multiplier: float,
+    ) -> float:
+        delay = self._compute_retry_backoff(attempt, multiplier=multiplier)
+        key = self._backoff_key(model_name)
+        now = time.monotonic()
+        current = float(self._model_backoff_until.get(key, 0.0) or 0.0)
+        next_until = max(current, now + delay)
+        self._model_backoff_until[key] = next_until
+        return max(0.0, next_until - now)
 
     def _build_messages(
         self,
@@ -440,6 +472,7 @@ class ModelExecutor:
 
         for attempt in range(attempts + 1):
             try:
+                await self._respect_model_backoff(model_name)
                 return await self.client.chat.completions.create(**request_kwargs)
             except BadRequestError as e:
                 last_err = e
@@ -448,13 +481,22 @@ class ModelExecutor:
                     raise
 
                 # Wait for model load and retry.
-                wait_for = max(30.0, backoff * (2**attempt) * 10.0)
+                configured_timeout = max(120.0, float(self.config.request_timeout_s or 600.0))
+                wait_for = min(configured_timeout, max(120.0, backoff * (2**attempt) * 30.0))
+                scheduled = self._schedule_model_backoff(
+                    model_name,
+                    attempt=attempt,
+                    multiplier=4.0,
+                )
                 logger.warning(
-                    "Model appears unloaded; waiting for load then retrying (%d/%d): %s",
+                    "Model appears unloaded; backing off %.1fs and waiting for load before retrying (%d/%d): %s",
+                    scheduled,
                     attempt + 1,
                     attempts,
                     model_name,
                 )
+                if scheduled > 0:
+                    await asyncio.sleep(scheduled)
                 await asyncio.to_thread(
                     preload_model,
                     model_name,
@@ -472,10 +514,14 @@ class ModelExecutor:
                 last_err = e
                 if attempt >= attempts:
                     raise
-                sleep_for = backoff * (2**attempt)
+                sleep_for = self._schedule_model_backoff(
+                    model_name,
+                    attempt=attempt,
+                    multiplier=1.0,
+                )
                 if sleep_for > 0:
                     logger.warning(
-                        "Model API timeout/connection error; retrying in %.1fs (%d/%d)",
+                        "Model API timeout/connection error; backing off %.1fs before retrying (%d/%d)",
                         sleep_for,
                         attempt + 1,
                         attempts,

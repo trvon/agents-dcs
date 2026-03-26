@@ -463,7 +463,10 @@ class DCSPipeline:
             async with self._init_client(weights) as client:
                 executor = ModelExecutor(self.config.executor_model)
                 decomposer = TaskDecomposer(self.config.executor_model)
-                planner = QueryPlanner(client)
+                planner = QueryPlanner(
+                    client,
+                    max_concurrency=int(self.config.retrieval_max_concurrency),
+                )
                 assembler = ContextAssembler(
                     budget=self.config.context_budget, model=self.config.executor_model.name
                 )

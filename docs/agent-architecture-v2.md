@@ -29,7 +29,7 @@ This architecture keeps accuracy-first retrieval, while adding supervision, chec
 
 3. Retrieval Engine
    - Uses staged order:
-     - `search -> graph -> grep + get`
+     - `prime index -> search -> validate anchors -> graph refine -> targeted grep + get`
    - Adds coverage controller:
      - if file coverage is low, force path-first retries.
    - Emits step traces (args, counts, filtered reasons, selected sources).
@@ -41,6 +41,7 @@ This architecture keeps accuracy-first retrieval, while adding supervision, chec
 
 5. Evaluation and Policy Layer
    - Benchmarks retrieval and final task outcomes.
+   - Keeps plan-review evaluation separate from answer-generation evaluation.
    - Applies strict acceptance gates (for this track: per-task recall@10 target).
    - Tracks regressions by task family.
 

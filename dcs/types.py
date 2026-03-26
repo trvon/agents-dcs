@@ -152,6 +152,77 @@ class FaithfulnessReport:
 
 
 # ---------------------------------------------------------------------------
+# Plan review types
+# ---------------------------------------------------------------------------
+
+
+class PlanStepStatus(str, Enum):
+    """Review status for a single plan step."""
+
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+    MISSING = "missing"
+    UNVERIFIED = "unverified"
+
+
+@dataclass
+class PlanStep:
+    """A normalized implementation-plan step."""
+
+    step_id: str
+    description: str
+    acceptance_criteria: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PlanStepReview:
+    """Review verdict for a single plan step."""
+
+    step_id: str
+    description: str
+    status: PlanStepStatus = PlanStepStatus.UNVERIFIED
+    confidence: float = 0.0
+    evidence: list[str] = field(default_factory=list)
+    gaps: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PlanReviewInput:
+    """Inputs for post-execution plan-vs-change review."""
+
+    plan: str
+    task: str = ""
+    diff_text: str = ""
+    change_summary: str = ""
+    execution_summary: str = ""
+    changed_files: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PlanReviewResult:
+    """Structured review of whether code changes satisfied a plan."""
+
+    task: str
+    plan_steps: list[PlanStep] = field(default_factory=list)
+    step_reviews: list[PlanStepReview] = field(default_factory=list)
+    coverage_score: float = 0.0
+    executed_well: bool = False
+    summary: str = ""
+    gaps: list[str] = field(default_factory=list)
+    advice: list[str] = field(default_factory=list)
+    suggested_tests: list[str] = field(default_factory=list)
+    followup_plan: list[str] = field(default_factory=list)
+    changed_files: list[str] = field(default_factory=list)
+    retrieved_sources: list[str] = field(default_factory=list)
+    ingested_artifacts: list[str] = field(default_factory=list)
+    context: ContextBlock | None = None
+    query_results: list[YAMSQueryResult] = field(default_factory=list)
+    model_output: str = ""
+    latency_ms: float = 0.0
+    raw_response: dict[str, Any] | None = None
+
+
+# ---------------------------------------------------------------------------
 # Pipeline types
 # ---------------------------------------------------------------------------
 
@@ -192,6 +263,7 @@ class PipelineResult:
     total_latency_ms: float = 0.0
     converged: bool = False
     best_iteration: int = 0
+    plan_review: PlanReviewResult | None = None
 
     @property
     def num_iterations(self) -> int:
@@ -223,7 +295,7 @@ class ModelConfig:
     # thinking models to disable chain-of-thought and save output tokens.
     system_suffix: str = ""
     # Execution controls
-    request_timeout_s: float = 120.0
+    request_timeout_s: float = 600.0
     max_retries: int = 2
     retry_backoff_s: float = 2.0
 
@@ -263,6 +335,7 @@ class PipelineConfig:
     max_queries_per_iteration: int = 5
     max_chunks_per_query: int = 10
     min_chunk_score: float = 0.1
+    retrieval_max_concurrency: int = 2
 
     # Iteration settings
     max_iterations: int = 3
@@ -286,6 +359,11 @@ class PipelineConfig:
     yams_binary: str = "yams"
     yams_data_dir: str | None = None
     yams_cwd: str | None = None  # scope search/grep to this directory tree
+
+    # Plan-review settings
+    plan_review_context_budget: int = 1536
+    plan_review_max_changed_files: int = 8
+    plan_review_search_limit: int = 4
 
     # Search weight overrides (passed to YAMS search)
     search_weights: dict[str, float] = field(default_factory=dict)
@@ -313,6 +391,8 @@ class EvalMetric(str, Enum):
     ITERATIONS_TO_CONVERGE = "iterations_to_converge"
     TOTAL_LATENCY = "total_latency"
     TOKEN_COST = "token_cost"
+    PLAN_COVERAGE = "plan_coverage"
+    PLAN_EXECUTED_WELL = "plan_executed_well"
 
 
 @dataclass
@@ -336,6 +416,9 @@ class EvalResult:
     metrics: dict[str, float] = field(default_factory=dict)
     passed: bool = False
     error: str | None = None
+    task_type: str = ""
+    tags: list[str] = field(default_factory=list)
+    repeat_index: int = 1
 
 
 @dataclass

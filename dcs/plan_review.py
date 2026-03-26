@@ -1,0 +1,530 @@
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+from dcs.assembler import ContextAssembler
+from dcs.client import YAMSClient
+from dcs.critic import _extract_first_json_object, _try_parse_json
+from dcs.executor import ModelExecutor
+from dcs.types import (
+    ContextBlock,
+    ModelConfig,
+    PipelineConfig,
+    PlanReviewInput,
+    PlanReviewResult,
+    PlanStep,
+    PlanStepReview,
+    PlanStepStatus,
+    QuerySpec,
+    QueryType,
+    YAMSChunk,
+    YAMSQueryResult,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _clamp01(x: float) -> float:
+    try:
+        xf = float(x)
+    except Exception:
+        return 0.0
+    if xf < 0.0:
+        return 0.0
+    if xf > 1.0:
+        return 1.0
+    return xf
+
+
+def parse_plan_steps(plan: str) -> list[PlanStep]:
+    text = (plan or "").strip()
+    if not text:
+        return []
+
+    steps: list[PlanStep] = []
+    current: list[str] = []
+    current_id = 0
+    bullet_re = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+(.*\S)\s*$")
+
+    def flush() -> None:
+        nonlocal current, current_id
+        if not current:
+            return
+        current_id += 1
+        description = current[0].strip()
+        acceptance = [line.strip() for line in current[1:] if line.strip()]
+        steps.append(
+            PlanStep(
+                step_id=f"step-{current_id}",
+                description=description,
+                acceptance_criteria=acceptance,
+            )
+        )
+        current = []
+
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            flush()
+            continue
+        m = bullet_re.match(line)
+        if m:
+            flush()
+            current = [m.group(1).strip()]
+            continue
+        if current:
+            current.append(line.strip())
+        else:
+            current = [line.strip()]
+    flush()
+
+    if steps:
+        return steps
+
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    out: list[PlanStep] = []
+    for idx, para in enumerate(paras, start=1):
+        out.append(PlanStep(step_id=f"step-{idx}", description=para))
+    return out
+
+
+def build_change_summary(review_input: PlanReviewInput) -> str:
+    changed_files = [str(p).strip() for p in review_input.changed_files if str(p).strip()]
+    lines = []
+    if review_input.task.strip():
+        lines.append(f"Task: {review_input.task.strip()}")
+    if changed_files:
+        lines.append("Changed files:")
+        for path in changed_files[:20]:
+            lines.append(f"- {path}")
+    if review_input.change_summary.strip():
+        lines.append("Change summary:")
+        lines.append(review_input.change_summary.strip())
+    if review_input.execution_summary.strip():
+        lines.append("Execution summary:")
+        lines.append(review_input.execution_summary.strip())
+    if review_input.diff_text.strip():
+        diff = review_input.diff_text.strip()
+        if len(diff) > 6000:
+            diff = diff[:6000].rstrip() + "\n... [truncated diff]"
+        lines.append("Diff excerpt:")
+        lines.append(diff)
+    return "\n".join(lines).strip()
+
+
+def _status_from_string(value: Any) -> PlanStepStatus:
+    raw = str(value or "").strip().lower()
+    for status in PlanStepStatus:
+        if status.value == raw:
+            return status
+    return PlanStepStatus.UNVERIFIED
+
+
+def _extract_changed_files_from_diff(diff_text: str) -> list[str]:
+    out: list[str] = []
+    for match in re.finditer(r"^\+\+\+\s+b/(.+)$", diff_text or "", flags=re.MULTILINE):
+        path = match.group(1).strip()
+        if path != "/dev/null" and path not in out:
+            out.append(path)
+    return out
+
+
+class PlanReviewer:
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+
+    def _build_client_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "yams_binary": self.config.yams_binary,
+            "yams_data_dir": self.config.yams_data_dir,
+        }
+        if self.config.yams_cwd:
+            kwargs["cwd"] = self.config.yams_cwd
+        return kwargs
+
+    def _normalize_input(self, review_input: PlanReviewInput) -> PlanReviewInput:
+        files = [str(p).strip() for p in review_input.changed_files if str(p).strip()]
+        if not files and review_input.diff_text:
+            files = _extract_changed_files_from_diff(review_input.diff_text)
+        max_files = max(1, int(self.config.plan_review_max_changed_files or 8))
+        return PlanReviewInput(
+            plan=review_input.plan,
+            task=review_input.task,
+            diff_text=review_input.diff_text,
+            change_summary=review_input.change_summary,
+            execution_summary=review_input.execution_summary,
+            changed_files=files[:max_files],
+        )
+
+    def _build_queries(
+        self, task: str, steps: list[PlanStep], changed_files: list[str]
+    ) -> list[QuerySpec]:
+        specs: list[QuerySpec] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add(query: str, query_type: QueryType, importance: float, reason: str) -> None:
+            q = (query or "").strip()
+            if not q:
+                return
+            key = (query_type.value, q)
+            if key in seen:
+                return
+            seen.add(key)
+            specs.append(
+                QuerySpec(
+                    query=q,
+                    query_type=query_type,
+                    importance=importance,
+                    reason=reason,
+                )
+            )
+
+        if task.strip():
+            add(task.strip(), QueryType.SEMANTIC, 1.0, "review task context")
+
+        for step in steps[:5]:
+            add(step.description, QueryType.SEMANTIC, 0.9, "plan step retrieval")
+
+        for path in changed_files[: int(self.config.plan_review_max_changed_files or 8)]:
+            add(path, QueryType.GET, 1.0, "changed file inspection")
+            add(path, QueryType.GRAPH, 0.7, "changed file graph context")
+            name = Path(path).name
+            if name:
+                add(f"{name} path:{path}", QueryType.GREP, 0.6, "changed file grep anchor")
+
+        return specs[: max(4, int(self.config.max_queries_per_iteration or 5) + 4)]
+
+    async def _ingest_artifacts(
+        self,
+        client: YAMSClient,
+        review_input: PlanReviewInput,
+        steps: list[PlanStep],
+        change_summary: str,
+    ) -> list[str]:
+        artifacts: list[str] = []
+        task_slug = re.sub(r"[^a-z0-9]+", "-", (review_input.task or "plan-review").lower()).strip(
+            "-"
+        )
+        task_slug = task_slug or "plan-review"
+        base_meta = {
+            "task": task_slug[:64],
+            "phase": "checkpoint",
+            "owner": "opencode",
+            "mode": "engineering",
+            "agent_id": "opencode-dcs-plan-review-benchmark",
+            "status": "open",
+        }
+        try:
+            plan_hash = await client.add(
+                content=json.dumps(
+                    {"task": review_input.task, "steps": [asdict(s) for s in steps]}, indent=2
+                ),
+                name=f"dcs-plan-review-plan-{task_slug}",
+                tags=["dcs", "plan-review", "plan"],
+                metadata={**base_meta, "source": "decision"},
+            )
+            artifacts.append(plan_hash)
+        except Exception as e:
+            logger.debug("Plan review plan ingestion failed: %s", e)
+
+        try:
+            change_hash = await client.add(
+                content=change_summary,
+                name=f"dcs-plan-review-changes-{task_slug}",
+                tags=["dcs", "plan-review", "changes"],
+                metadata={**base_meta, "source": "evidence"},
+            )
+            artifacts.append(change_hash)
+        except Exception as e:
+            logger.debug("Plan review change ingestion failed: %s", e)
+
+        return artifacts
+
+    def _review_prompt(
+        self,
+        review_input: PlanReviewInput,
+        context: ContextBlock,
+        steps: list[PlanStep],
+        change_summary: str,
+    ) -> list[dict[str, Any]]:
+        schema = {
+            "coverage_score": "number 0.0-1.0",
+            "executed_well": "boolean",
+            "summary": "string",
+            "gaps": ["string"],
+            "advice": ["string"],
+            "suggested_tests": ["string"],
+            "followup_plan": ["string"],
+            "step_reviews": [
+                {
+                    "step_id": "string",
+                    "description": "string",
+                    "status": "complete|partial|missing|unverified",
+                    "confidence": "number 0.0-1.0",
+                    "evidence": ["string"],
+                    "gaps": ["string"],
+                }
+            ],
+        }
+        sys = (
+            "You are a strict code-change plan reviewer. Judge whether the implementation changes "
+            "satisfied the plan using only the supplied change summary and retrieved repository context. "
+            "Return JSON only. Be conservative when evidence is weak."
+        )
+        plan_block = json.dumps([asdict(s) for s in steps], indent=2)
+        user = (
+            f"TASK:\n{(review_input.task or '').strip()}\n\n"
+            f"PLAN:\n{plan_block}\n\n"
+            f"CHANGES:\n{change_summary}\n\n"
+            f"RETRIEVED CONTEXT:\n{context.content}\n\n"
+            f"Return JSON with this schema:\n{json.dumps(schema, indent=2)}"
+        )
+        return [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user},
+        ]
+
+    def _heuristic_review(
+        self,
+        review_input: PlanReviewInput,
+        steps: list[PlanStep],
+        query_results: list[YAMSQueryResult],
+        context: ContextBlock,
+    ) -> PlanReviewResult:
+        haystack = "\n".join(
+            [
+                review_input.change_summary,
+                review_input.diff_text,
+                review_input.execution_summary,
+                context.content,
+            ]
+        ).lower()
+        step_reviews: list[PlanStepReview] = []
+        completed = 0
+        gaps: list[str] = []
+        for step in steps:
+            tokens = [
+                t.lower() for t in re.findall(r"[A-Za-z0-9_./-]+", step.description) if len(t) >= 4
+            ]
+            hits = sum(1 for token in tokens[:8] if token in haystack)
+            if tokens and hits >= max(1, len(tokens[:4]) // 2):
+                status = PlanStepStatus.COMPLETE
+                completed += 1
+            elif hits > 0:
+                status = PlanStepStatus.PARTIAL
+                gaps.append(f"Partial evidence for: {step.description}")
+            else:
+                status = PlanStepStatus.MISSING
+                gaps.append(f"No clear evidence for: {step.description}")
+            step_reviews.append(
+                PlanStepReview(
+                    step_id=step.step_id,
+                    description=step.description,
+                    status=status,
+                    confidence=1.0 if status == PlanStepStatus.COMPLETE else (0.5 if hits else 0.1),
+                    evidence=[src for src in review_input.changed_files[:3]],
+                    gaps=[]
+                    if status == PlanStepStatus.COMPLETE
+                    else [f"Verify {step.description}"],
+                )
+            )
+
+        coverage = completed / max(1, len(steps)) if steps else 0.0
+        sources: list[str] = []
+        for qr in query_results:
+            for chunk in qr.chunks:
+                if chunk.source and chunk.source not in sources:
+                    sources.append(chunk.source)
+        advice = ["Add targeted verification for any partially implemented steps."] if gaps else []
+        tests = [
+            f"Add regression test for {step.description}" for step in steps[:2] if step.description
+        ]
+        followup = [gap for gap in gaps[:3]]
+        return PlanReviewResult(
+            task=review_input.task or "",
+            plan_steps=steps,
+            step_reviews=step_reviews,
+            coverage_score=coverage,
+            executed_well=coverage >= 0.8 and not gaps,
+            summary="Heuristic review completed.",
+            gaps=gaps,
+            advice=advice,
+            suggested_tests=tests,
+            followup_plan=followup,
+            changed_files=list(review_input.changed_files),
+            retrieved_sources=sources,
+            context=context,
+            query_results=query_results,
+        )
+
+    def _parse_review_response(
+        self,
+        data: dict[str, Any],
+        review_input: PlanReviewInput,
+        steps: list[PlanStep],
+        query_results: list[YAMSQueryResult],
+        context: ContextBlock,
+        raw_output: str,
+        latency_ms: float,
+        ingested_artifacts: list[str],
+    ) -> PlanReviewResult:
+        reviews_raw = data.get("step_reviews")
+        reviews: list[PlanStepReview] = []
+        if isinstance(reviews_raw, list):
+            for item in reviews_raw:
+                if not isinstance(item, dict):
+                    continue
+                reviews.append(
+                    PlanStepReview(
+                        step_id=str(item.get("step_id") or ""),
+                        description=str(item.get("description") or ""),
+                        status=_status_from_string(item.get("status")),
+                        confidence=_clamp01(item.get("confidence") or 0.0),
+                        evidence=[str(x) for x in (item.get("evidence") or []) if x is not None],
+                        gaps=[str(x) for x in (item.get("gaps") or []) if x is not None],
+                    )
+                )
+
+        if not reviews:
+            reviews = [
+                PlanStepReview(
+                    step_id=step.step_id,
+                    description=step.description,
+                    status=PlanStepStatus.UNVERIFIED,
+                )
+                for step in steps
+            ]
+
+        sources: list[str] = []
+        for qr in query_results:
+            for chunk in qr.chunks:
+                if chunk.source and chunk.source not in sources:
+                    sources.append(chunk.source)
+
+        return PlanReviewResult(
+            task=review_input.task or "",
+            plan_steps=steps,
+            step_reviews=reviews,
+            coverage_score=_clamp01(data.get("coverage_score") or 0.0),
+            executed_well=bool(data.get("executed_well", False)),
+            summary=str(data.get("summary") or "").strip(),
+            gaps=[str(x) for x in (data.get("gaps") or []) if x is not None],
+            advice=[str(x) for x in (data.get("advice") or []) if x is not None],
+            suggested_tests=[str(x) for x in (data.get("suggested_tests") or []) if x is not None],
+            followup_plan=[str(x) for x in (data.get("followup_plan") or []) if x is not None],
+            changed_files=list(review_input.changed_files),
+            retrieved_sources=sources,
+            ingested_artifacts=list(ingested_artifacts),
+            context=context,
+            query_results=query_results,
+            model_output=raw_output,
+            latency_ms=latency_ms,
+            raw_response=data,
+        )
+
+    async def review(self, review_input: PlanReviewInput) -> PlanReviewResult:
+        start = time.perf_counter()
+        normalized = self._normalize_input(review_input)
+        steps = parse_plan_steps(normalized.plan)
+        change_summary = build_change_summary(normalized)
+        query_results: list[YAMSQueryResult] = []
+        context = ContextBlock(content="", budget=self.config.plan_review_context_budget)
+        ingested_artifacts: list[str] = []
+
+        async with YAMSClient(**self._build_client_kwargs()) as client:
+            ingested_artifacts = await self._ingest_artifacts(
+                client, normalized, steps, change_summary
+            )
+            specs = self._build_queries(normalized.task, steps, normalized.changed_files)
+            for spec in specs:
+                try:
+                    result = await client.execute_spec(spec)
+                except Exception as e:
+                    result = YAMSQueryResult(spec=spec, chunks=[], error=str(e))
+                result.chunks = list(result.chunks or [])[
+                    : int(self.config.plan_review_search_limit or 4)
+                ]
+                query_results.append(result)
+
+            assembler = ContextAssembler(
+                budget=int(self.config.plan_review_context_budget or 1536),
+                model=self.config.executor_model.name,
+            )
+
+            synthetic = list(query_results)
+            if change_summary:
+                synthetic.append(
+                    YAMSQueryResult(
+                        spec=QuerySpec(
+                            query="plan-review-change-summary",
+                            query_type=QueryType.GET,
+                            importance=1.0,
+                            reason="local change summary",
+                        ),
+                        chunks=[
+                            YAMSChunk(
+                                chunk_id="plan-review-change-summary",
+                                content=change_summary,
+                                score=1.0,
+                                source="plan-review",
+                            )
+                        ],
+                    )
+                )
+            context = assembler.assemble(synthetic, task=normalized.task)
+
+        critic_cfg: ModelConfig = self.config.critic_model or self.config.executor_model
+        executor = ModelExecutor(critic_cfg)
+        messages = self._review_prompt(normalized, context, steps, change_summary)
+        raw_output = ""
+        data: dict[str, Any] | None = None
+        try:
+            exec_result = await executor.execute_raw(
+                messages,
+                model=critic_cfg.name,
+                temperature=min(0.2, float(critic_cfg.temperature or 0.0)),
+                max_tokens=min(int(critic_cfg.max_output_tokens or 1024), 1200),
+            )
+            raw_output = exec_result.output or ""
+            blob = _extract_first_json_object(raw_output or "")
+            parsed = _try_parse_json(blob or raw_output or "")
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception as e:
+            logger.warning("Plan review model call failed: %s", e)
+
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        if data is None:
+            result = self._heuristic_review(normalized, steps, query_results, context)
+            result.ingested_artifacts = list(ingested_artifacts)
+            result.model_output = raw_output
+            result.latency_ms = latency_ms
+            return result
+        return self._parse_review_response(
+            data,
+            normalized,
+            steps,
+            query_results,
+            context,
+            raw_output,
+            latency_ms,
+            ingested_artifacts,
+        )
+
+
+__all__ = [
+    "PlanReviewer",
+    "PlanReviewInput",
+    "PlanReviewResult",
+    "PlanStep",
+    "PlanStepReview",
+    "PlanStepStatus",
+    "build_change_summary",
+    "parse_plan_steps",
+]

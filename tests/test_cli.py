@@ -92,10 +92,12 @@ def test_build_parser_parses_subcommands(tmp_path: Path) -> None:
     parser = cli._build_parser(tmp_path)
     run_args = parser.parse_args(["run", "hello"])
     eval_args = parser.parse_args(["eval", "--type", "qa"])
+    review_args = parser.parse_args(["review", "--plan", "1. do x"])
     status_args = parser.parse_args(["status"])
 
     assert run_args.cmd == "run"
     assert eval_args.cmd == "eval"
+    assert review_args.cmd == "review"
     assert status_args.cmd == "status"
 
 
@@ -166,6 +168,56 @@ async def test_cmd_eval_and_compare_paths(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert rc_compare == 0
     assert "run_suite" in calls
     assert "compare_report" in calls
+
+
+@pytest.mark.asyncio
+async def test_cmd_review_reads_inputs_and_writes_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plan_file = tmp_path / "plan.txt"
+    plan_file.write_text("1. add review mode", encoding="utf-8")
+    summary_file = tmp_path / "summary.txt"
+    summary_file.write_text("updated cli and reviewer", encoding="utf-8")
+    out_file = tmp_path / "review.json"
+
+    class FakeReviewer:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        async def review(self, review_input):
+            assert review_input.plan == "1. add review mode"
+            assert review_input.change_summary == "updated cli and reviewer"
+            from dcs.types import PlanReviewResult
+
+            return PlanReviewResult(
+                task="demo",
+                coverage_score=0.9,
+                executed_well=True,
+                summary="looks good",
+                suggested_tests=["test review command"],
+            )
+
+    monkeypatch.setattr(cli, "PlanReviewer", FakeReviewer)
+    console = Console(record=True)
+    rc = await cli._cmd_review(
+        argparse.Namespace(
+            task="demo",
+            plan="",
+            plan_file=str(plan_file),
+            diff_file=None,
+            change_summary="",
+            change_summary_file=str(summary_file),
+            execution_summary="",
+            execution_summary_file=None,
+            changed_files="a.py,b.py",
+            json_out=str(out_file),
+        ),
+        PipelineConfig(),
+        console,
+    )
+    assert rc == 0
+    assert out_file.exists()
+    assert "looks good" in console.export_text()
 
 
 @pytest.mark.asyncio

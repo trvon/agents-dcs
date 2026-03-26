@@ -47,6 +47,34 @@ def test_adaptive_followups_add_graph_from_file_chunks() -> None:
     assert "mcp_server.cpp" in graph[0].query
 
 
+def test_validated_paths_only_keep_high_confidence_anchors() -> None:
+    planner = QueryPlanner(_StubYAMS())
+    res = YAMSQueryResult(
+        spec=QuerySpec(
+            query="registerTool path:src/mcp/mcp_server.cpp",
+            query_type=QueryType.GREP,
+            importance=0.9,
+        ),
+        chunks=[
+            YAMSChunk(
+                chunk_id="good",
+                content="registerTool registration",
+                score=0.9,
+                source="/repo/src/mcp/mcp_server.cpp",
+            ),
+            YAMSChunk(
+                chunk_id="bad",
+                content="unrelated docs",
+                score=0.2,
+                source="/repo/docs/mcp.md",
+            ),
+        ],
+    )
+
+    paths = planner._validated_paths_from_results([res], min_confidence=0.6, per_result=1)
+    assert paths == ["/repo/src/mcp/mcp_server.cpp"]
+
+
 class _StageStubYAMS:
     def __init__(self) -> None:
         self.calls: list[tuple[QueryType, str]] = []
@@ -134,3 +162,33 @@ async def test_execute_adds_graph_guided_grep_and_get_specs() -> None:
 
     assert any("path:/repo/src/mcp/mcp_server.cpp" in q for q in grep_queries)
     assert "/repo/src/mcp/mcp_server.cpp" in get_queries
+
+
+def test_top_graph_paths_prefers_related_neighbors() -> None:
+    planner = QueryPlanner(_StubYAMS())
+    graph_results = [
+        YAMSQueryResult(
+            spec=QuerySpec(
+                query="/repo/src/mcp/mcp_server.cpp depth:1 limit:25",
+                query_type=QueryType.GRAPH,
+                importance=0.8,
+            ),
+            chunks=[
+                YAMSChunk(
+                    chunk_id="same-subsystem",
+                    content="[file] /repo/include/yams/mcp/tool_registry.h",
+                    source="/repo/include/yams/mcp/tool_registry.h",
+                    score=0.7,
+                ),
+                YAMSChunk(
+                    chunk_id="far-away",
+                    content="[file] /repo/src/vector/embedding_service.cpp",
+                    source="/repo/src/vector/embedding_service.cpp",
+                    score=0.72,
+                ),
+            ],
+        )
+    ]
+
+    ranked = planner._top_graph_paths(graph_results, limit=2)
+    assert ranked[0] == "/repo/include/yams/mcp/tool_registry.h"
