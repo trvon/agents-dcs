@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from dcs.types import YAMSChunk
 from dcs.client import YAMSClient
 
 
@@ -69,3 +70,51 @@ def test_extract_tool_data_accepts_structured_content_without_data_wrapper() -> 
     extracted = YAMSClient._extract_tool_data(payload)
     assert isinstance(extracted, dict)
     assert "results" in extracted
+
+
+def test_rerank_code_chunks_prefers_code_authority_and_identifier_overlap() -> None:
+    chunks = [
+        YAMSChunk(
+            chunk_id="1",
+            content="EmbeddingService details",
+            score=0.4,
+            source="/repo/docs/embedding_service.md",
+        ),
+        YAMSChunk(
+            chunk_id="2",
+            content="# /repo/src/vector/embedding_service.cpp\nclass EmbeddingService",
+            score=0.3,
+            source="/repo/src/vector/embedding_service.cpp",
+        ),
+    ]
+    ranked = YAMSClient._rerank_code_chunks("How does the EmbeddingService work?", chunks)
+    assert ranked[0].source == "/repo/src/vector/embedding_service.cpp"
+
+
+def test_rerank_code_chunks_penalizes_results_artifacts() -> None:
+    chunks = [
+        YAMSChunk(
+            chunk_id="1",
+            content="mcp_server.cpp result artifact",
+            score=0.9,
+            source="/repo/external/agent/results/mcp_server.json",
+        ),
+        YAMSChunk(
+            chunk_id="2",
+            content="# /repo/src/mcp/mcp_server.cpp\nregisterTool",
+            score=0.4,
+            source="/repo/src/mcp/mcp_server.cpp",
+        ),
+    ]
+    ranked = YAMSClient._rerank_code_chunks(
+        "tool names registered in mcp_server.cpp",
+        chunks,
+    )
+    assert ranked[0].source == "/repo/src/mcp/mcp_server.cpp"
+
+
+def test_query_terms_split_camel_case_identifiers() -> None:
+    terms = YAMSClient._query_terms("How does the EmbeddingService work?")
+    assert "embeddingservice" in terms
+    assert "embedding" in terms
+    assert "service" in terms

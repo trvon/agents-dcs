@@ -4,6 +4,19 @@ description: >
   Explain the SearchEngine class in YAMS. What is the class declaration,
   what search types does it support, and how does hybrid search combine
   results from different backends?
+plan: |
+  Tests First
+  1. Identify the SearchEngine declaration and constructor surface.
+  - Cite the header that defines the class and key public methods.
+  2. Verify which search modes/backends participate in the engine.
+  - Cover keyword, semantic/vector, graph, and hybrid/fusion concepts if present.
+  3. Explain how hybrid search fuses results.
+  - Ground the explanation in the concrete fusion or ranking path, not just high-level guesses.
+
+  Acceptance Gates
+  - Must mention SearchEngine by name.
+  - Must explain at least two backend families used in hybrid search.
+  - Must describe how combined ranking or fusion works without hallucinating unsupported components.
 ground_truth:
   files:
     - src/search/search_engine.cpp

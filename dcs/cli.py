@@ -14,7 +14,8 @@ from rich.table import Table
 
 from dcs.executor import ModelExecutor
 from dcs.pipeline import DCSPipeline
-from dcs.plan_review import PlanReviewer
+from dcs.plan_review import PlanReviewer, _looks_like_rich_plan_prompt
+from dcs.runtime_config import load_runtime_settings
 from dcs.types import ModelConfig, PipelineConfig, TaskType
 
 
@@ -187,6 +188,9 @@ async def _cmd_review(args: argparse.Namespace, cfg: PipelineConfig, console: Co
     plan = _read_optional_text(getattr(args, "plan_file", None))
     if not plan:
         plan = str(getattr(args, "plan", "") or "").strip()
+    task_text = str(getattr(args, "task", "") or "").strip()
+    if not plan and _looks_like_rich_plan_prompt(task_text):
+        plan = task_text
     if not plan:
         console.print("Plan review requires --plan or --plan-file")
         return 2
@@ -195,7 +199,7 @@ async def _cmd_review(args: argparse.Namespace, cfg: PipelineConfig, console: Co
 
     review_input = PlanReviewInput(
         plan=plan,
-        task=str(getattr(args, "task", "") or "").strip(),
+        task=task_text,
         diff_text=_read_optional_text(getattr(args, "diff_file", None)),
         change_summary=_read_optional_text(getattr(args, "change_summary_file", None))
         or str(getattr(args, "change_summary", "") or "").strip(),
@@ -381,15 +385,24 @@ def _resolve_path(env_var: str, preferred: Path, fallback: Path) -> Path:
 def main() -> None:
     console = Console()
     base_dir = Path(__file__).resolve().parents[1]
-    config_dir = _resolve_path("DCS_CONFIG_DIR", base_dir / "configs", Path.cwd() / "configs")
+    runtime = load_runtime_settings(base_dir)
+    config_dir = _resolve_path(
+        "DCS_CONFIG_DIR",
+        runtime.config_dir or (base_dir / "configs"),
+        Path.cwd() / "configs",
+    )
     default_task_dir = _resolve_path(
-        "DCS_TASK_DIR", base_dir / "eval" / "tasks", Path.cwd() / "eval" / "tasks"
+        "DCS_TASK_DIR",
+        runtime.task_dir or (base_dir / "eval" / "tasks"),
+        Path.cwd() / "eval" / "tasks",
     )
 
     parser = _build_parser(default_task_dir)
     args = parser.parse_args()
 
     cfg = _apply_runtime_overrides(args, load_pipeline_config(config_dir))
+    if not cfg.yams_cwd and runtime.yams_cwd is not None:
+        cfg.yams_cwd = str(runtime.yams_cwd)
 
     async def run_cmd() -> int:
         if args.cmd == "run":

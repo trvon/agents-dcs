@@ -44,6 +44,12 @@ Interpretation guidance:
 - `graph_useful_neighbor_ratio` should go up only when graph refinement is helping; high query count with low graph utility is a smell.
 - Watch `source_count` and `chunk_count` for breadth explosions that bloat downstream prompts.
 
+Current retrieval baseline:
+
+- Keep the non-DSPy file-authority rerank baseline from `results/retrieval_rerank_v2.json` as the mixed-suite reference.
+- DSPy retrieval reranking and BootstrapFewShot optimizer paths remain experimental; they improved noise/latency in some runs but did not beat the baseline on primary file-ranking metrics.
+- If you run DSPy experiments anyway, prefer explicit raw ids for all model flags so executor, critic, and reranker can share one loaded LM Studio model.
+
 If you explicitly benchmark model-driven decomposition, set:
 
 ```bash
@@ -57,8 +63,9 @@ Use this for end-to-end answer quality and routing behavior.
 ```bash
 research-agent-benchmark-coverage \
   --task-dir eval/tasks \
-  --models gpt-oss-120b-executor \
+  --models qwen-122b-executor \
   --critic gpt-oss-20b-critic \
+  --plan-review \
   --task-seeding=false \
   --checkpoint results/coverage_checkpoint.json \
   --out results/coverage_results.json
@@ -76,22 +83,29 @@ Example sequential comparison:
 ```bash
 research-agent-benchmark-coverage \
   --task-dir eval/tasks \
-  --models gpt-oss-120b-executor \
-  --critic gpt-oss-20b-critic \
-  --context-profile large \
-  --task-seeding=false \
-  --out results/gpt120b.json
-
-research-agent-benchmark-coverage \
-  --task-dir eval/tasks \
   --models qwen-122b-executor \
   --critic gpt-oss-20b-critic \
   --context-profile large \
   --task-seeding=false \
   --out results/qwen122b.json
 
-research-agent-benchmark-report results/gpt120b.json results/qwen122b.json --out results/head_to_head.json
+research-agent-benchmark-coverage \
+  --task-dir eval/tasks \
+  --models qwen35-35b-a3b \
+  --critic gpt-oss-20b-critic \
+  --context-profile large \
+  --task-seeding=false \
+  --out results/qwen35b.json
+
+research-agent-benchmark-report results/qwen122b.json results/qwen35b.json --out results/head_to_head.json
 ```
+
+Plan review in coverage runs:
+
+- Pass `--plan-review` to attach plan-review metrics during coverage benchmarking.
+- Tasks can provide structured plan text via top-level `plan:` or `evaluation.plan:`.
+- If no explicit plan is present but the task description is itself a structured research/build prompt, the benchmark treats that prompt as the plan source automatically.
+- Report output includes `plan_coverage_mean` when plan review metrics are present.
 
 Checkpoint behavior:
 
@@ -103,6 +117,7 @@ Checkpoint behavior:
 - Override retrieval scope with `YAMS_CWD=/path/to/repo` or `--yams-cwd`.
 - Default scope resolves dynamically from the current checkout.
 - Benchmarks prime indexing inside the scoped repo, so `--yams-cwd` also controls what gets re-indexed.
+- Checked-in runtime defaults now live in `config.toml` for config/task/yams paths and critic debug artifacts.
 
 ## Plan Review Benchmarking Readiness
 

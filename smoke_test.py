@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from dcs.pipeline import DCSPipeline
+from dcs.runtime_config import load_runtime_settings
 from dcs.types import ModelConfig, PipelineConfig
 
 logging.basicConfig(
@@ -35,9 +36,13 @@ TASK = (
 
 
 def _default_yams_cwd() -> str:
+    base_dir = Path(__file__).resolve().parent
+    runtime = load_runtime_settings(base_dir)
     env_cwd = os.environ.get("YAMS_CWD", "").strip()
     if env_cwd:
         return env_cwd
+    if runtime.yams_cwd is not None:
+        return str(runtime.yams_cwd)
     # external/agent/smoke_test.py -> external -> yams
     repo_root = Path(__file__).resolve().parents[2]
     if (repo_root / "src").exists():

@@ -9,6 +9,7 @@ import pytest
 from rich.console import Console
 
 from dcs import cli
+from dcs.runtime_config import load_runtime_settings
 from dcs.types import EvalResult, EvalTask, ModelConfig, PipelineConfig, PipelineResult, TaskType
 
 
@@ -86,6 +87,27 @@ def test_apply_runtime_overrides_and_resolve_path(
     assert cli._resolve_path("DCS_TEST_PATH", preferred, tmp_path) == fallback
     monkeypatch.delenv("DCS_TEST_PATH")
     assert cli._resolve_path("DCS_TEST_PATH", preferred, fallback) == preferred
+
+
+def test_load_runtime_settings_from_config_toml(tmp_path: Path) -> None:
+    (tmp_path / "config.toml").write_text(
+        """
+[paths]
+config_dir = "configs"
+task_dir = "eval/tasks"
+yams_cwd = "../repo"
+
+[debug]
+critic_debug_dir = "artifacts/critic"
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    settings = load_runtime_settings(tmp_path)
+    assert settings.config_dir == (tmp_path / "configs").resolve()
+    assert settings.task_dir == (tmp_path / "eval" / "tasks").resolve()
+    assert settings.yams_cwd == (tmp_path / "../repo").resolve()
+    assert settings.critic_debug_dir == (tmp_path / "artifacts" / "critic").resolve()
 
 
 def test_build_parser_parses_subcommands(tmp_path: Path) -> None:

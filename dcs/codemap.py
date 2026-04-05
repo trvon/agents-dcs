@@ -23,6 +23,7 @@ Key YAMS graph relations used:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -30,6 +31,10 @@ from typing import Any
 from .types import ContextBlock
 
 logger = logging.getLogger(__name__)
+
+_CODEMAP_NOISE_RE = re.compile(
+    r"(?:^|/)(?:external/agent/results|external/agent/eval/tasks|\.git|build|dist|__pycache__|node_modules)(?:/|$)"
+)
 
 
 @dataclass
@@ -70,9 +75,10 @@ class CodemapBuilder:
         self,
         yams_client: Any,  # YAMSClient (avoid circular import)
         token_budget: int = 512,
-        max_files: int = 50,
-        max_symbols_per_file: int = 20,
+        max_files: int = 5,
+        max_symbols_per_file: int = 8,
         max_depth: int = 2,
+        include_type_counts: bool = False,
     ):
         self._client = yams_client
         self._token_budget = token_budget
@@ -80,6 +86,7 @@ class CodemapBuilder:
         self._max_symbols_per_file = max_symbols_per_file
         self._max_depth = min(max_depth, 5)  # YAMS caps at 5
         self._query_count = 0
+        self._include_type_counts = bool(include_type_counts)
 
     async def build(
         self,
@@ -102,8 +109,12 @@ class CodemapBuilder:
 
         focus_types = focus_types or ["file", "function", "class"]
 
+        # Prefer task-anchored file selection over broad file listings.
+        if not focus_paths and task:
+            focus_paths = await self._select_focus_paths(task)
+
         # Step 1: Discover what's in the KG
-        type_counts = await self._get_type_counts()
+        type_counts = await self._get_type_counts() if self._include_type_counts else {}
         logger.info("codemap: KG node types: %s", type_counts)
 
         # Step 2: Get file nodes (either focused or top-level)
@@ -158,12 +169,151 @@ class CodemapBuilder:
         )
         return result
 
+    async def _select_focus_paths(self, task: str) -> list[str]:
+        try:
+            chunks = await self._client.search(task, limit=max(self._max_files * 2, 12))
+        except Exception as e:
+            logger.warning("codemap: focus path search failed: %s", e)
+            return []
+
+        seen: set[str] = set()
+        out: list[str] = []
+        for chunk in chunks:
+            source = (chunk.source or "").strip()
+            if not source or source in seen or not self._is_code_path(source):
+                continue
+            if not self._path_matches_task(source, task) and len(out) >= max(
+                2, self._max_files // 2
+            ):
+                continue
+            seen.add(source)
+            out.append(source)
+            if len(out) >= self._max_files:
+                break
+        return out
+
+    @staticmethod
+    def _task_terms(task: str) -> list[str]:
+        out: list[str] = []
+        for token in re.findall(r"[A-Za-z0-9_./-]+", task or ""):
+            raw = token.strip("._/-")
+            t = raw.lower()
+            if len(t) < 4:
+                continue
+            if t in {"what", "does", "used", "use", "with", "from", "that", "this", "how"}:
+                continue
+            if t not in out:
+                out.append(t)
+            camel_parts = re.findall(r"[A-Z]?[a-z]+|[0-9]+", raw)
+            for part in camel_parts:
+                part_l = part.lower()
+                if len(part_l) >= 4 and part_l not in out:
+                    out.append(part_l)
+            for part in re.findall(r"[a-z]+|[0-9]+", t.replace("_", "-")):
+                if len(part) >= 4 and part not in out:
+                    out.append(part)
+        return out
+
+    def _path_matches_task(self, path: str, task: str) -> bool:
+        p = (path or "").lower()
+        terms = self._task_terms(task)
+        return any(term in p for term in terms[:12])
+
+    @staticmethod
+    def _is_code_symbol_type(node_type: str) -> bool:
+        normalized = str(node_type or "").lower()
+        return normalized in {
+            "function",
+            "function_version",
+            "class",
+            "class_version",
+            "method",
+            "method_version",
+            "struct",
+            "struct_version",
+            "enum",
+            "enum_version",
+            "interface",
+            "interface_version",
+            "trait",
+            "trait_version",
+            "namespace",
+            "namespace_version",
+            "variable",
+            "variable_version",
+            "constant",
+            "constant_version",
+            "typedef",
+            "typedef_version",
+            "macro",
+            "macro_version",
+            "field",
+            "field_version",
+        }
+
+    @staticmethod
+    def _is_code_path(path: str) -> bool:
+        p = (path or "").strip()
+        if not p or _CODEMAP_NOISE_RE.search(p):
+            return False
+        return p.endswith(
+            (
+                ".cpp",
+                ".cc",
+                ".cxx",
+                ".c",
+                ".hpp",
+                ".h",
+                ".hh",
+                ".py",
+                ".rs",
+                ".ts",
+                ".tsx",
+                ".js",
+                ".go",
+                ".java",
+            )
+        )
+
+    @staticmethod
+    def _symbol_display(item: dict[str, Any]) -> str:
+        label = str(item.get("label") or "").strip()
+        node_key = str(item.get("nodeKey") or item.get("node_key") or "")
+        if not label and node_key:
+            label = node_key
+        if "@" in label:
+            label = label.split("@", 1)[0]
+        if "::" in label:
+            label = label.split("::")[-1]
+        return label.strip()
+
+    @staticmethod
+    def _normalize_symbol_type(node_type: str, node_key: str) -> str:
+        normalized = str(node_type or "").lower().replace("_version", "")
+        if normalized in {"function", "class", "method", "struct", "enum", "namespace"}:
+            return normalized
+        key_type = str(node_key or "").split(":", 1)[0].lower()
+        if key_type in {"function", "class", "method", "struct", "enum", "namespace"}:
+            return key_type
+        return normalized
+
+    @staticmethod
+    def _path_from_graph_item(item: dict[str, Any]) -> str:
+        label = str(item.get("label") or "").strip()
+        if label.startswith("/"):
+            return label
+        node_key = str(item.get("nodeKey") or item.get("node_key") or "")
+        marker = "path:file:"
+        if marker in node_key:
+            return node_key.split(marker, 1)[1].split("@", 1)[0]
+        return label
+
     async def _get_type_counts(self) -> dict[str, int]:
         """Query KG for node type counts."""
         try:
             self._query_count += 1
             data = await self._client.graph_query(list_types=True)
-            counts = data.get("nodeTypeCounts")
+            counts = data.get("node_type_counts") or data.get("nodeTypeCounts")
             if isinstance(counts, dict):
                 return {str(k): int(v) for k, v in counts.items() if isinstance(v, (int, float))}
         except Exception as e:
@@ -184,7 +334,8 @@ class CodemapBuilder:
                 node = await self._query_file_node(path)
                 if node:
                     nodes.append(node)
-            return nodes
+            if nodes:
+                return nodes
 
         # No focus paths: list file nodes from KG
         try:
@@ -193,7 +344,7 @@ class CodemapBuilder:
                 list_type="file",
                 limit=self._max_files,
             )
-            connected = data.get("connectedNodes") or []
+            connected = data.get("connected_nodes") or data.get("connectedNodes") or []
             # list_type response may use different structure; also check origin
             if not connected:
                 # For list_type queries, nodes may be in a flat array structure
@@ -212,9 +363,9 @@ class CodemapBuilder:
                     props = {}
 
                 # Extract short path from node_key (strip "file:" prefix)
-                display = node_key
-                if display.startswith("file:"):
-                    display = display[5:]
+                display = self._path_from_graph_item(item) or node_key
+                if not self._is_code_path(display):
+                    continue
 
                 nodes.append(
                     GraphNode(
@@ -241,12 +392,12 @@ class CodemapBuilder:
             seen_sources: set[str] = set()
             for chunk in chunks:
                 source = (chunk.source or "").strip()
-                if not source or source in seen_sources:
+                if not source or source in seen_sources or not self._is_code_path(source):
                     continue
                 seen_sources.add(source)
                 nodes.append(
                     GraphNode(
-                        node_key=f"file:{source}",
+                        node_key=f"path:file:{source}",
                         node_type="file",
                         label=source,
                     )
@@ -303,35 +454,26 @@ class CodemapBuilder:
                 limit=self._max_symbols_per_file * 2,  # fetch extra, trim later
             )
 
-            connected = data.get("connectedNodes") or []
-            edge_count = int(data.get("totalEdgesTraversed") or len(connected))
+            connected = data.get("connected_nodes") or data.get("connectedNodes") or []
+            edge_count = int(
+                data.get("total_edges_traversed")
+                or data.get("totalEdgesTraversed")
+                or len(connected)
+            )
 
             symbols: list[GraphNode] = []
             for item in connected:
                 if not isinstance(item, dict):
                     continue
                 node_key = str(item.get("nodeKey") or item.get("node_key") or "")
-                node_type = str(item.get("type") or "unknown")
-                label = str(item.get("label") or "")
+                node_type = self._normalize_symbol_type(item.get("type"), node_key)
+                label = self._symbol_display(item)
                 props = item.get("properties") or {}
                 if isinstance(props, str):
                     props = {}
 
                 # Filter to code symbols
-                if node_type not in (
-                    "function",
-                    "class",
-                    "method",
-                    "struct",
-                    "enum",
-                    "interface",
-                    "trait",
-                    "namespace",
-                    "variable",
-                    "constant",
-                    "typedef",
-                    "macro",
-                ):
+                if not self._is_code_symbol_type(node_type):
                     continue
 
                 # Extract short name from node_key
@@ -368,7 +510,6 @@ class CodemapBuilder:
                 "macro": 3,
             }
             symbols.sort(key=lambda s: (type_order.get(s.node_type, 9), s.label))
-
             return symbols, edge_count
 
         except Exception as e:
@@ -430,16 +571,17 @@ class CodemapBuilder:
                 if fnode.children:
                     for sym in fnode.children:
                         type_tag = sym.node_type
-                        if type_tag in ("function", "method"):
+                        normalized = type_tag.replace("_version", "")
+                        if normalized in ("function", "method"):
                             prefix = "fn"
-                        elif type_tag in ("class", "struct"):
+                        elif normalized in ("class", "struct"):
                             prefix = "cls"
-                        elif type_tag == "enum":
+                        elif normalized == "enum":
                             prefix = "enum"
-                        elif type_tag == "namespace":
+                        elif normalized == "namespace":
                             prefix = "ns"
                         else:
-                            prefix = type_tag[:3]
+                            prefix = normalized[:3]
                         lines.append(f"    [{prefix}] {sym.label}")
 
             lines.append("")

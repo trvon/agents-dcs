@@ -4,6 +4,19 @@ description: >
   How does YAMS expose its functionality over MCP (Model Context Protocol)?
   How is the server started, what transport does it use, and how does
   a client communicate with it?
+plan: |
+  Tests First
+  1. Identify how the MCP server is started.
+  - Include the CLI or daemon entrypoint responsible for startup.
+  2. Confirm the transport and wire protocol.
+  - Explain stdio/NDJSON/JSON-RPC details only if grounded in the code.
+  3. Summarize how clients invoke tools.
+  - Mention tool registration and request handling at a high level.
+
+  Acceptance Gates
+  - Must mention MCP or Model Context Protocol explicitly.
+  - Must mention the transport used by the server.
+  - Must explain how a client issues tool calls or requests.
 ground_truth:
   files:
     - src/mcp/stdio_transport.cpp

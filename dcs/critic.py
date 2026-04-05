@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 try:
@@ -26,6 +28,7 @@ except Exception:  # pragma: no cover
     BadRequestError = Exception  # type: ignore[assignment]
     AsyncOpenAI = None  # type: ignore[assignment]
 
+from dcs.runtime_config import load_runtime_settings
 from dcs.types import ContextBlock, Critique, ExecutionResult, ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -180,6 +183,37 @@ def _try_parse_json(text: str) -> dict[str, Any] | list[Any] | None:
         return None
 
 
+def _as_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        parts = [p.strip(" -*\t\n\r") for p in re.split(r"[\n;,]+", text) if p.strip()]
+        return [p for p in parts if p]
+    return []
+
+
+def _as_score(value: Any) -> float:
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith("%"):
+            text = text[:-1].strip()
+            try:
+                return float(text) / 100.0
+            except Exception:
+                return 0.0
+        try:
+            return float(text)
+        except Exception:
+            return 0.0
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
 class SelfCritic:
     """Ask a (possibly larger) model to critique context and output."""
 
@@ -189,6 +223,129 @@ class SelfCritic:
             self.client = None
         else:
             self.client = AsyncOpenAI(base_url=config.base_url, api_key=config.api_key)
+
+    @staticmethod
+    def _critique_json_schema() -> dict[str, Any]:
+        return {
+            "name": "dcs_critique",
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "context_utilization": {"type": "number"},
+                    "missing_info": {"type": "array", "items": {"type": "string"}},
+                    "irrelevant_chunks": {"type": "array", "items": {"type": "string"}},
+                    "quality_score": {"type": "number"},
+                    "suggested_queries": {"type": "array", "items": {"type": "string"}},
+                    "reasoning": {"type": "string"},
+                },
+                "required": [
+                    "context_utilization",
+                    "missing_info",
+                    "irrelevant_chunks",
+                    "quality_score",
+                    "suggested_queries",
+                    "reasoning",
+                ],
+            },
+        }
+
+    def _supports_json_schema(self) -> bool:
+        name = str(self.config.name or "").lower()
+        return any(k in name for k in ("qwen", "gpt-oss", "openai/"))
+
+    def _is_qwen_model(self) -> bool:
+        return "qwen" in str(self.config.name or "").lower()
+
+    def _critic_system_suffix(self) -> str:
+        suffix = (self.config.system_suffix or "").strip()
+        if suffix:
+            return suffix
+        if self._is_qwen_model():
+            return "/no_think"
+        return ""
+
+    def _dump_debug_artifact(
+        self,
+        *,
+        task: str,
+        messages: list[dict[str, Any]],
+        content: str,
+        note: str,
+        raw: dict[str, Any] | None = None,
+    ) -> None:
+        debug_dir = os.environ.get("DCS_CRITIC_DEBUG_DIR", "").strip()
+        if not debug_dir:
+            runtime = load_runtime_settings(Path(__file__).resolve().parents[1])
+            debug_dir = str(runtime.critic_debug_dir or "").strip()
+        if not debug_dir:
+            return
+        try:
+            path = Path(debug_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            slug = re.sub(r"[^a-z0-9]+", "-", (task or "critic").lower()).strip("-") or "critic"
+            stamp = str(int(time.time() * 1000))
+            out = path / f"{stamp}-{slug}.json"
+            out.write_text(
+                json.dumps(
+                    {
+                        "model": self.config.name,
+                        "note": note,
+                        "task": task,
+                        "messages": messages,
+                        "content": content,
+                        "raw": raw,
+                    },
+                    indent=2,
+                    ensure_ascii=True,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.debug("Failed to write critic debug artifact", exc_info=True)
+
+    def _extract_message_content(self, raw: dict[str, Any]) -> str:
+        choices = raw.get("choices") or []
+        if not choices:
+            return ""
+        msg = (choices[0] or {}).get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                return content
+        reasoning_content = msg.get("reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content.strip():
+            return reasoning_content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text)
+            return "\n".join(parts)
+        return ""
+
+    async def _request_critique(
+        self, messages: list[dict[str, Any]], *, use_json_schema: bool
+    ) -> tuple[str, float, dict[str, Any]]:
+        kwargs: dict[str, Any] = {
+            "model": self.config.name,
+            "messages": messages,
+            "temperature": float(self.config.temperature),
+            "max_tokens": int(min(self.config.max_output_tokens, 768)),
+        }
+        if use_json_schema:
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": self._critique_json_schema(),
+            }
+        start = time.perf_counter()
+        resp = await self.client.chat.completions.create(**kwargs)
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        raw = resp.model_dump()
+        return self._extract_message_content(raw), latency_ms, raw
 
     async def critique(self, task: str, context: ContextBlock, result: ExecutionResult) -> Critique:
         if self.client is None:
@@ -200,28 +357,42 @@ class SelfCritic:
 
         messages = self._build_critique_prompt(task=task, context=context, result=result)
 
-        start = time.perf_counter()
         try:
-            resp = await self.client.chat.completions.create(
-                model=self.config.name,
-                messages=messages,
-                temperature=float(self.config.temperature),
-                max_tokens=int(min(self.config.max_output_tokens, 512)),
-            )
-            raw = resp.model_dump()
-            choices = raw.get("choices") or []
-            content = ""
-            if choices:
-                msg = (choices[0] or {}).get("message") or {}
-                if isinstance(msg.get("content"), str):
-                    content = msg["content"]
-            latency_ms = (time.perf_counter() - start) * 1000.0
+            try:
+                content, latency_ms, raw = await self._request_critique(
+                    messages,
+                    use_json_schema=self._supports_json_schema(),
+                )
+                if self._supports_json_schema() and not content.strip():
+                    self._dump_debug_artifact(
+                        task=task,
+                        messages=messages,
+                        content=content,
+                        note="empty_json_schema_critique",
+                        raw=raw,
+                    )
+                    content, latency_ms, raw = await self._request_critique(
+                        messages, use_json_schema=False
+                    )
+            except BadRequestError as e:
+                if "response_format" not in str(e).lower():
+                    raise
+                content, latency_ms, raw = await self._request_critique(
+                    messages, use_json_schema=False
+                )
             logger.debug("Critique call completed in %.1fms", latency_ms)
 
             parsed = self._parse_critique(content, context=context)
             if parsed is not None:
                 return parsed
 
+            self._dump_debug_artifact(
+                task=task,
+                messages=messages,
+                content=content,
+                note="unparseable_critique",
+                raw=raw,
+            )
             logger.warning("Critique model output unparseable; falling back to heuristics")
             c = self._heuristic_critique(task=task, context=context, result=result)
             c.reasoning = (
@@ -247,6 +418,12 @@ class SelfCritic:
             ).strip()
             return c
         except Exception as e:
+            self._dump_debug_artifact(
+                task=task,
+                messages=messages,
+                content=str(e),
+                note="critic_exception",
+            )
             logger.exception("Unexpected critique failure; using heuristics")
             c = self._heuristic_critique(task=task, context=context, result=result)
             c.reasoning = (
@@ -276,10 +453,10 @@ class SelfCritic:
         schema = (
             "Return a JSON object with this exact schema:\n\n"
             "{\n"
-            '  "context_utilization": number,  // 0.0-1.0\n'
+            '  "context_utilization": number,\n'
             '  "missing_info": string[],\n'
-            '  "irrelevant_chunks": string[],  // choose only from chunk_ids provided\n'
-            '  "quality_score": number,  // 0.0-1.0\n'
+            '  "irrelevant_chunks": string[],\n'
+            '  "quality_score": number,\n'
             '  "suggested_queries": string[],\n'
             '  "reasoning": string\n'
             "}\n\n"
@@ -287,6 +464,7 @@ class SelfCritic:
             "- Output the JSON object FIRST and ONLY ONCE.\n"
             "- Use conservative scores when uncertain.\n"
             "- irrelevant_chunks must be a subset of the provided chunk_ids.\n"
+            "- Use decimal scores between 0.0 and 1.0, not percentages.\n"
         )
 
         sys = (
@@ -294,6 +472,16 @@ class SelfCritic:
             "Judge whether the retrieved context helped the model produce a good output. "
             "Return ONLY the JSON object.\n\n" + schema
         )
+        if self._is_qwen_model():
+            sys += (
+                "\n\nQwen-specific rules:\n"
+                "- Do not emit <think> blocks.\n"
+                "- Do not use markdown fences.\n"
+                "- Start with '{' and end with '}'.\n"
+            )
+        suffix = self._critic_system_suffix()
+        if suffix:
+            sys += "\n" + suffix
 
         sources = context.sources or []
         chunk_ids = context.chunk_ids or []
@@ -330,7 +518,7 @@ class SelfCritic:
             f"CONTEXT ({context_meta}): sources={json.dumps(sources[:10])}, chunk_ids={json.dumps(chunk_ids[:10])}\n"
             f"{ctx_content}\n\n"
             f"OUTPUT:\n{model_output}\n\n"
-            "Return the JSON object."
+            "Return the JSON object only. Start immediately with '{'."
         )
 
         return [
@@ -358,33 +546,64 @@ class SelfCritic:
         if not isinstance(data, dict):
             return None
 
-        missing_info = data.get("missing_info")
-        if not isinstance(missing_info, list):
-            missing_info = []
-        missing_info = [str(x) for x in missing_info if x is not None]
+        for nested_key in ("critique", "evaluation", "result"):
+            nested = data.get(nested_key)
+            if isinstance(nested, dict):
+                data = nested
+                break
 
-        irrelevant_chunks = data.get("irrelevant_chunks")
-        if not isinstance(irrelevant_chunks, list):
-            irrelevant_chunks = []
-        irrelevant_chunks = [str(x) for x in irrelevant_chunks if x is not None]
+        missing_info = _as_string_list(
+            data.get("missing_info", data.get("missing", data.get("gaps", [])))
+        )
+
+        irrelevant_chunks = _as_string_list(
+            data.get(
+                "irrelevant_chunks",
+                data.get("irrelevant", data.get("irrelevant_chunk_ids", [])),
+            )
+        )
 
         # Enforce subset of provided chunk IDs (when present) to keep downstream logic stable.
         known = set(context.chunk_ids or [])
         if known:
-            irrelevant_chunks = [cid for cid in irrelevant_chunks if cid in known]
+            alias_map: dict[str, str] = {}
+            for cid in known:
+                alias_map[cid] = cid
+                alias_map[cid.lower()] = cid
+            for src, cid in zip(context.sources or [], context.chunk_ids or []):
+                if not src or not cid:
+                    continue
+                alias_map[src] = cid
+                alias_map[src.lower()] = cid
+                base = src.rsplit("/", 1)[-1]
+                if base:
+                    alias_map[base] = cid
+                    alias_map[base.lower()] = cid
+            normalized: list[str] = []
+            for item in irrelevant_chunks:
+                key = item if item in alias_map else item.lower()
+                cid = alias_map.get(key)
+                if cid and cid not in normalized:
+                    normalized.append(cid)
+            irrelevant_chunks = normalized
 
-        suggested_queries = data.get("suggested_queries")
-        if not isinstance(suggested_queries, list):
-            suggested_queries = []
-        suggested_queries = [str(x) for x in suggested_queries if x is not None]
+        suggested_queries = _as_string_list(
+            data.get("suggested_queries", data.get("queries", data.get("followup_queries", [])))
+        )
 
-        reasoning = data.get("reasoning")
+        reasoning = data.get("reasoning", data.get("explanation", data.get("notes", "")))
         if not isinstance(reasoning, str):
             reasoning = ""
 
         # Some models use alternate key names; tolerate a few common variants.
-        context_util = data.get("context_utilization", data.get("context_usage", 0.0))
-        quality = data.get("quality_score", data.get("quality", 0.0))
+        context_util = _as_score(
+            data.get(
+                "context_utilization", data.get("context_usage", data.get("context_score", 0.0))
+            )
+        )
+        quality = _as_score(
+            data.get("quality_score", data.get("quality", data.get("overall_score", 0.0)))
+        )
 
         return Critique(
             context_utilization=_clamp01(context_util),

@@ -19,6 +19,7 @@ from dcs.client import YAMSClient
 from dcs.decomposer import TaskDecomposer
 from dcs.indexing import prime_yams_index
 from dcs.planner import QueryPlanner
+from dcs.runtime_config import load_runtime_settings
 from dcs.types import (
     EvalTask,
     ModelConfig,
@@ -33,11 +34,15 @@ from eval.runner import EvalRunner
 
 def _default_paths() -> tuple[str, str, str]:
     base_dir = Path(__file__).resolve().parents[1]
-    task_dir = str(base_dir / "eval" / "tasks")
-    models_cfg = str(base_dir / "configs" / "models.yaml")
+    runtime = load_runtime_settings(base_dir)
+    task_dir = str(runtime.task_dir or (base_dir / "eval" / "tasks"))
+    config_dir = runtime.config_dir or (base_dir / "configs")
+    models_cfg = str(config_dir / "models.yaml")
     env_cwd = os.environ.get("YAMS_CWD", "").strip()
     if env_cwd:
         return task_dir, models_cfg, env_cwd
+    if runtime.yams_cwd is not None:
+        return task_dir, models_cfg, str(runtime.yams_cwd)
     # external/agent -> external -> yams
     repo_root = base_dir.parents[1]
     return task_dir, models_cfg, str(repo_root)
@@ -52,19 +57,74 @@ def _load_models_config(path: Path) -> dict[str, Any]:
 
 def _build_model_config(models_cfg: dict[str, Any], key: str) -> ModelConfig:
     models = models_cfg.get("models") or {}
+    backends = models_cfg.get("backends") or {}
     if key not in models:
         raise KeyError(f"model key not found: {key}")
     m = models[key] or {}
+    backend = backends.get(m.get("backend"), {}) if isinstance(m, dict) else {}
+
+    def _pick(name: str, default: Any) -> Any:
+        value = m.get(name) if isinstance(m, dict) else None
+        return default if value is None else value
+
     return ModelConfig(
-        name=str(m.get("name") or key),
-        base_url=str(m.get("base_url") or "http://localhost:1234/v1"),
-        api_key=str(m.get("api_key") or "lm-studio"),
-        context_window=int(m.get("context_window") or 8192),
-        max_output_tokens=int(m.get("max_output_tokens") or 2048),
-        temperature=float(m.get("temperature") or 0.7),
-        request_timeout_s=float(m.get("request_timeout_s") or 600.0),
-        max_retries=int(m.get("max_retries") or 2),
-        retry_backoff_s=float(m.get("retry_backoff_s") or 2.0),
+        name=str(_pick("name", key)),
+        base_url=str(_pick("base_url", backend.get("base_url") or "http://localhost:1234/v1")),
+        api_key=str(_pick("api_key", backend.get("api_key") or "lm-studio")),
+        context_window=int(_pick("context_window", 8192)),
+        max_output_tokens=int(_pick("max_output_tokens", 2048)),
+        temperature=float(_pick("temperature", 0.7)),
+        request_timeout_s=float(_pick("request_timeout_s", 600.0)),
+        max_retries=int(_pick("max_retries", 2)),
+        retry_backoff_s=float(_pick("retry_backoff_s", 2.0)),
+    )
+
+
+def _build_model_config_or_id(
+    models_cfg: dict[str, Any],
+    raw: str,
+    *,
+    preferred_role: str | None = None,
+    default_temperature: float = 0.0,
+) -> ModelConfig:
+    models = models_cfg.get("models") or {}
+    if raw in models:
+        return _build_model_config(models_cfg, raw)
+
+    for key, spec in models.items():
+        if not isinstance(spec, dict):
+            continue
+        name = str(spec.get("name") or "")
+        if name != raw:
+            continue
+        role = str(spec.get("role") or "")
+        if preferred_role is None or role == preferred_role:
+            return _build_model_config(models_cfg, str(key))
+
+    if not raw.startswith("openai/"):
+        openai_name = f"openai/{raw}"
+        for key, spec in models.items():
+            if not isinstance(spec, dict):
+                continue
+            name = str(spec.get("name") or "")
+            if name != openai_name:
+                continue
+            role = str(spec.get("role") or "")
+            if preferred_role is None or role == preferred_role:
+                return _build_model_config(models_cfg, str(key))
+
+    backends = models_cfg.get("backends") or {}
+    default_backend = backends.get("lmstudio") or {}
+    return ModelConfig(
+        name=str(raw),
+        base_url=str(default_backend.get("base_url") or "http://localhost:1234/v1"),
+        api_key=str(default_backend.get("api_key") or "lm-studio"),
+        context_window=8192,
+        max_output_tokens=1024,
+        temperature=float(default_temperature),
+        request_timeout_s=600.0,
+        max_retries=2,
+        retry_backoff_s=2.0,
     )
 
 
@@ -187,6 +247,273 @@ def _collect_files(task: EvalTask) -> list[str]:
         if s and s not in out:
             out.append(s)
     return out
+
+
+def _demo_terms(task: EvalTask) -> list[str]:
+    gt = task.ground_truth or {}
+    out: list[str] = []
+    for key in ("symbols", "patterns"):
+        vals = gt.get(key)
+        if not isinstance(vals, list):
+            continue
+        for item in vals:
+            token = str(item).strip()
+            if token.startswith("re:"):
+                token = token[3:]
+            token = re.sub(r"[^A-Za-z0-9_./-]+", " ", token).strip()
+            if token and token not in out:
+                out.append(token)
+    return out
+
+
+def _select_demo_tasks(tasks: list[EvalTask], current_task: EvalTask, limit: int) -> list[EvalTask]:
+    if limit <= 0:
+        return []
+    buckets: dict[str, list[EvalTask]] = {}
+    for task in tasks:
+        if task.id == current_task.id:
+            continue
+        buckets.setdefault(task.task_type.value, []).append(task)
+
+    ordered_types = sorted(buckets)
+    selected: list[EvalTask] = []
+    while len(selected) < limit:
+        progressed = False
+        for task_type in ordered_types:
+            items = buckets.get(task_type) or []
+            if not items:
+                continue
+            selected.append(items.pop(0))
+            progressed = True
+            if len(selected) >= limit:
+                break
+        if not progressed:
+            break
+    return selected
+
+
+def _build_dspy_rerank_demos(
+    tasks: list[EvalTask], current_task: EvalTask, limit: int
+) -> list[dict[str, Any]]:
+    selected = _select_demo_tasks(tasks, current_task, limit)
+    if not selected:
+        return []
+
+    all_other_tasks = [task for task in tasks if task.id != current_task.id]
+    demos: list[dict[str, Any]] = []
+    for task in selected:
+        positives = _collect_files(task)[:2]
+        if not positives:
+            continue
+
+        distractors: list[tuple[str, EvalTask | None]] = []
+        for other in all_other_tasks:
+            if other.id == task.id:
+                continue
+            for path in _collect_files(other):
+                if path not in positives:
+                    distractors.append((path, other))
+                    break
+            if len(distractors) >= 2:
+                break
+        while len(distractors) < 2:
+            fallback = [
+                ("docs/architecture.md", None),
+                ("tests/unit/example_test.cpp", None),
+            ][len(distractors)]
+            if fallback not in distractors:
+                distractors.append(fallback)
+
+        candidate_specs: list[tuple[str, EvalTask | None, bool]] = []
+        candidate_specs.append((distractors[0][0], distractors[0][1], False))
+        candidate_specs.append((positives[0], task, True))
+        candidate_specs.append((distractors[1][0], distractors[1][1], False))
+        if len(positives) > 1:
+            candidate_specs.append((positives[1], task, True))
+
+        candidates_json: list[dict[str, Any]] = []
+        ranked_ids: list[int] = []
+        for idx, (path, source_task, relevant) in enumerate(candidate_specs, start=1):
+            terms = _demo_terms(source_task)[:4] if source_task is not None else []
+            preview_parts = [
+                f"task={source_task.task_type.value}" for _ in [0] if source_task is not None
+            ]
+            if terms:
+                preview_parts.append("terms=" + ", ".join(terms))
+            if not preview_parts:
+                preview_parts.append("non-code distractor or unrelated file")
+            candidates_json.append(
+                {
+                    "id": idx,
+                    "name": Path(path).name,
+                    "source": path,
+                    "preview": " | ".join(preview_parts),
+                }
+            )
+            if relevant:
+                ranked_ids.append(idx)
+
+        demos.append(
+            {
+                "query": task.description,
+                "max_ranked_ids": len(candidate_specs),
+                "candidates_json": json.dumps(candidates_json, ensure_ascii=True),
+                "ranked_ids": ranked_ids,
+            }
+        )
+    return demos
+
+
+def _build_optimizer_rerank_examples(tasks: list[EvalTask], limit: int) -> list[Any]:
+    if limit <= 0:
+        return []
+
+    try:
+        import dspy  # type: ignore[import-not-found]
+    except Exception:
+        return []
+
+    examples: list[Any] = []
+    fallback_noise = [
+        "docs/architecture.md",
+        "results/benchmark_summary.json",
+        "tests/unit/example_test.cpp",
+    ]
+    for task in tasks[: max(0, int(limit))]:
+        positives = _collect_files(task)[:2]
+        if not positives:
+            continue
+
+        candidate_specs: list[tuple[str, bool, str]] = []
+        terms = ", ".join(_demo_terms(task)[:4]) or task.task_type.value
+        for path in positives:
+            candidate_specs.append((path, True, f"task={task.task_type.value} | terms={terms}"))
+        for noise_path in fallback_noise:
+            if noise_path not in [p for p, _, _ in candidate_specs]:
+                candidate_specs.append((noise_path, False, "noise file unrelated to the query"))
+            if len(candidate_specs) >= 5:
+                break
+
+        candidates_json: list[dict[str, Any]] = []
+        ranked_ids: list[int] = []
+        for idx, (path, relevant, preview) in enumerate(candidate_specs, start=1):
+            candidates_json.append(
+                {
+                    "id": idx,
+                    "name": Path(path).name,
+                    "source": path,
+                    "preview": preview,
+                }
+            )
+            if relevant:
+                ranked_ids.append(idx)
+
+        examples.append(
+            dspy.Example(
+                query=task.description,
+                max_ranked_ids=min(5, len(candidate_specs)),
+                candidates_json=json.dumps(candidates_json, ensure_ascii=True),
+                ranked_ids=ranked_ids,
+            ).with_inputs("query", "max_ranked_ids", "candidates_json")
+        )
+    return examples
+
+
+def _dspy_rerank_metric(example: Any, prediction: Any, trace: Any = None) -> float:
+    gold = QueryPlanner._coerce_ranked_ids(getattr(example, "ranked_ids", []) or [], 128)
+    pred = QueryPlanner._coerce_ranked_ids(getattr(prediction, "ranked_ids", []) or [], 128)
+    if not gold or not pred:
+        return 0.0
+
+    gold_set = set(gold)
+    top_pred = pred[: len(gold)]
+    overlap = sum(1 for item in top_pred if item in gold_set) / max(1, len(gold_set))
+    reciprocal = 0.0
+    for idx, item in enumerate(pred, start=1):
+        if item in gold_set:
+            reciprocal = 1.0 / idx
+            break
+    precision = sum(1 for item in pred if item in gold_set) / max(1, len(pred))
+    return max(0.0, min(1.0, 0.5 * overlap + 0.3 * reciprocal + 0.2 * precision))
+
+
+def _count_predictor_demos(program: Any) -> int:
+    try:
+        predictors = list(program.named_predictors())
+    except Exception:
+        return 0
+
+    total = 0
+    for _, predictor in predictors:
+        demos = getattr(predictor, "demos", None) or []
+        total += len(demos)
+    return total
+
+
+def _build_compiled_dspy_reranker(
+    config: PipelineConfig, train_tasks: list[EvalTask]
+) -> Any | None:
+    if not config.use_dspy_retrieval_rerank or not config.dspy_retrieval_optimize:
+        return None
+
+    try:
+        import dspy  # type: ignore[import-not-found]
+    except Exception:
+        return None
+
+    model_cfg = config.dspy_retrieval_model or config.critic_model or config.executor_model
+    candidates = [model_cfg.name]
+    if not model_cfg.name.startswith("openai/"):
+        candidates.append(f"openai/{model_cfg.name}")
+
+    lm = None
+    for model_name in candidates:
+        try:
+            lm = dspy.LM(
+                model_name,
+                api_base=model_cfg.base_url,
+                api_key=model_cfg.api_key,
+                temperature=0.0,
+                max_tokens=max(128, int(config.dspy_retrieval_max_tokens or 16384)),
+                timeout=float(model_cfg.request_timeout_s),
+            )
+            break
+        except Exception:
+            continue
+    if lm is None:
+        return None
+
+    trainset = _build_optimizer_rerank_examples(
+        train_tasks,
+        limit=int(config.dspy_retrieval_optimizer_trainset_size),
+    )
+    if not trainset:
+        return None
+
+    sig = QueryPlanner._build_dspy_signature()
+    adapter_candidates: list[Any] = []
+    if bool(config.dspy_retrieval_prefer_json) and hasattr(dspy, "JSONAdapter"):
+        adapter_candidates.append(dspy.JSONAdapter())
+    if hasattr(dspy, "ChatAdapter"):
+        adapter_candidates.append(dspy.ChatAdapter())
+
+    for adapter in adapter_candidates:
+        optimizer = dspy.BootstrapFewShot(
+            metric=_dspy_rerank_metric,
+            metric_threshold=float(config.dspy_retrieval_metric_threshold),
+            max_bootstrapped_demos=int(config.dspy_retrieval_bootstrapped_demos),
+            max_labeled_demos=int(config.dspy_retrieval_labeled_demos),
+            max_rounds=1,
+        )
+        try:
+            with dspy.context(lm=lm, adapter=adapter):
+                student = dspy.Predict(sig)
+                compiled = optimizer.compile(student, trainset=trainset)
+            if _count_predictor_demos(compiled) > 0:
+                return compiled
+        except Exception:
+            continue
+    return None
 
 
 def _task_metrics(task: EvalTask, query_results: list[Any]) -> dict[str, float]:
@@ -317,9 +644,56 @@ async def _run_suite(
             decomposer_cfg = replace(config.executor_model)
             decomposer_cfg.temperature = float(decomposer_temperature)
             decomposer = TaskDecomposer(decomposer_cfg)
-        planner = QueryPlanner(yams)
+        dspy_rerank_model = None
+        if config.use_dspy_retrieval_rerank:
+            try:
+                import dspy  # type: ignore[import-not-found]
+
+                model_cfg = (
+                    config.dspy_retrieval_model or config.critic_model or config.executor_model
+                )
+                candidates = [model_cfg.name]
+                if not model_cfg.name.startswith("openai/"):
+                    candidates.append(f"openai/{model_cfg.name}")
+                for model_name in candidates:
+                    try:
+                        dspy_rerank_model = dspy.LM(
+                            model_name,
+                            api_base=model_cfg.base_url,
+                            api_key=model_cfg.api_key,
+                            temperature=0.0,
+                            max_tokens=max(128, int(config.dspy_retrieval_max_tokens or 16384)),
+                            timeout=float(model_cfg.request_timeout_s),
+                        )
+                        break
+                    except Exception:
+                        continue
+            except Exception:
+                dspy_rerank_model = None
+        planner = QueryPlanner(
+            yams,
+            dspy_rerank_model=dspy_rerank_model,
+            dspy_rerank_top_k=int(config.dspy_retrieval_top_k),
+            dspy_rerank_prefer_json=bool(config.dspy_retrieval_prefer_json),
+        )
         out = []
         for t in tasks:
+            dspy_rerank_predictor = None
+            if dspy_rerank_model is not None and config.dspy_retrieval_optimize:
+                train_tasks = [task for task in tasks if task.id != t.id]
+                dspy_rerank_predictor = _build_compiled_dspy_reranker(config, train_tasks)
+            planner = QueryPlanner(
+                yams,
+                dspy_rerank_model=dspy_rerank_model,
+                dspy_rerank_predictor=dspy_rerank_predictor,
+                dspy_rerank_top_k=int(config.dspy_retrieval_top_k),
+                dspy_rerank_demos=_build_dspy_rerank_demos(
+                    tasks,
+                    current_task=t,
+                    limit=int(config.dspy_retrieval_demo_count),
+                ),
+                dspy_rerank_prefer_json=bool(config.dspy_retrieval_prefer_json),
+            )
             out.append(
                 await _run_task(
                     t,
@@ -400,6 +774,53 @@ def main() -> int:
         default=900.0,
         help="Timeout for pre-benchmark indexing wait",
     )
+    parser.add_argument(
+        "--dspy-retrieval-rerank",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable/disable DSPy reranking over top-K retrieval candidates",
+    )
+    parser.add_argument(
+        "--dspy-retrieval-top-k",
+        type=int,
+        default=5,
+        help="Top-K candidates to rerank with DSPy when enabled",
+    )
+    parser.add_argument(
+        "--dspy-retrieval-demo-count",
+        type=int,
+        default=0,
+        help="Number of cross-task DSPy reranker demos to include (experimental; default off)",
+    )
+    parser.add_argument(
+        "--dspy-retrieval-optimize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compile the DSPy reranker with BootstrapFewShot before benchmarking",
+    )
+    parser.add_argument(
+        "--dspy-retrieval-trainset-size",
+        type=int,
+        default=6,
+        help="Number of eval tasks to convert into DSPy optimizer examples",
+    )
+    parser.add_argument(
+        "--dspy-retrieval-adapter",
+        choices=["json", "chat"],
+        default="json",
+        help="Preferred DSPy adapter for reranking",
+    )
+    parser.add_argument(
+        "--dspy-retrieval-max-tokens",
+        type=int,
+        default=16384,
+        help="DSPy reranker max output tokens",
+    )
+    parser.add_argument(
+        "--dspy-retrieval-model",
+        default="openai/gpt-oss-20b",
+        help="DSPy reranker model key or raw model id",
+    )
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
@@ -426,9 +847,26 @@ def main() -> int:
     critic_key = args.critic or defaults.get("critic", "qwen35-35b-a3b")
 
     config = PipelineConfig(
-        executor_model=_build_model_config(models_cfg, exec_key),
-        critic_model=_build_model_config(models_cfg, critic_key),
+        executor_model=_build_model_config_or_id(
+            models_cfg, exec_key, preferred_role="executor", default_temperature=1.0
+        ),
+        critic_model=_build_model_config_or_id(
+            models_cfg, critic_key, preferred_role="critic", default_temperature=0.0
+        ),
         yams_cwd=args.yams_cwd,
+        use_dspy_retrieval_rerank=bool(args.dspy_retrieval_rerank),
+        dspy_retrieval_top_k=int(args.dspy_retrieval_top_k),
+        dspy_retrieval_max_tokens=int(args.dspy_retrieval_max_tokens),
+        dspy_retrieval_demo_count=int(args.dspy_retrieval_demo_count),
+        dspy_retrieval_prefer_json=str(args.dspy_retrieval_adapter) == "json",
+        dspy_retrieval_optimize=bool(args.dspy_retrieval_optimize),
+        dspy_retrieval_optimizer_trainset_size=int(args.dspy_retrieval_trainset_size),
+        dspy_retrieval_model=_build_model_config_or_id(
+            models_cfg,
+            str(args.dspy_retrieval_model),
+            preferred_role="critic",
+            default_temperature=0.0,
+        ),
     )
 
     runner = EvalRunner(PipelineConfig(), task_dir=args.task_dir)
@@ -488,6 +926,8 @@ def main() -> int:
         "config": {
             "executor": exec_key,
             "critic": critic_key,
+            "executor_model_name": config.executor_model.name,
+            "critic_model_name": config.critic_model.name if config.critic_model else None,
             "task_dir": args.task_dir,
             "task_type": args.task_type,
             "tags": sorted(tags),
@@ -497,6 +937,17 @@ def main() -> int:
             "task_seeding": bool(args.task_seeding),
             "decomposer_temperature": float(args.decomposer_temperature),
             "prime_index": bool(args.prime_index),
+            "dspy_retrieval_rerank": bool(args.dspy_retrieval_rerank),
+            "dspy_retrieval_top_k": int(args.dspy_retrieval_top_k),
+            "dspy_retrieval_max_tokens": int(args.dspy_retrieval_max_tokens),
+            "dspy_retrieval_demo_count": int(args.dspy_retrieval_demo_count),
+            "dspy_retrieval_optimize": bool(args.dspy_retrieval_optimize),
+            "dspy_retrieval_trainset_size": int(args.dspy_retrieval_trainset_size),
+            "dspy_retrieval_adapter": str(args.dspy_retrieval_adapter),
+            "dspy_retrieval_model": str(args.dspy_retrieval_model),
+            "dspy_retrieval_model_name": (
+                config.dspy_retrieval_model.name if config.dspy_retrieval_model else None
+            ),
             "tag_match": str(args.tag_match),
         },
         "summary": summary,

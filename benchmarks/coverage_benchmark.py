@@ -15,19 +15,33 @@ from rich.table import Table
 from dcs.indexing import prime_yams_index
 from dcs.lmstudio_context import get_context_length, preload_model
 from dcs.pipeline import DCSPipeline
+from dcs.plan_review import PlanReviewer, _looks_like_rich_plan_prompt
+from dcs.runtime_config import load_runtime_settings
 from dcs.router import RoutingPolicy, TieredRouter
-from dcs.types import EvalResult, EvalTask, ModelConfig, PipelineConfig, PipelineResult, TaskType
+from dcs.types import (
+    EvalResult,
+    EvalTask,
+    ModelConfig,
+    PipelineConfig,
+    PipelineResult,
+    PlanReviewInput,
+    TaskType,
+)
 from eval.metrics import evaluate_task
 from eval.runner import EvalRunner
 
 
 def _default_paths() -> tuple[str, str, str]:
     base_dir = Path(__file__).resolve().parents[1]
-    task_dir = str(base_dir / "eval" / "tasks")
-    models_cfg = str(base_dir / "configs" / "models.yaml")
+    runtime = load_runtime_settings(base_dir)
+    task_dir = str(runtime.task_dir or (base_dir / "eval" / "tasks"))
+    config_dir = runtime.config_dir or (base_dir / "configs")
+    models_cfg = str(config_dir / "models.yaml")
     env_cwd = os.environ.get("YAMS_CWD", "").strip()
     if env_cwd:
         return task_dir, models_cfg, env_cwd
+    if runtime.yams_cwd is not None:
+        return task_dir, models_cfg, str(runtime.yams_cwd)
     # external/agent -> external -> yams
     repo_root = base_dir.parents[1]
     return task_dir, models_cfg, str(repo_root)
@@ -65,6 +79,56 @@ def _build_model_config(models_cfg: dict[str, Any], key: str) -> ModelConfig:
         request_timeout_s=float(spec.get("request_timeout_s", 600.0)),
         max_retries=int(spec.get("max_retries", 2)),
         retry_backoff_s=float(spec.get("retry_backoff_s", 2.0)),
+    )
+
+
+def _build_model_config_or_id(
+    models_cfg: dict[str, Any],
+    raw: str,
+    *,
+    preferred_role: str | None = None,
+    default_temperature: float = 0.0,
+) -> ModelConfig:
+    models = models_cfg.get("models") or {}
+    if raw in models:
+        return _build_model_config(models_cfg, raw)
+
+    for key, spec in models.items():
+        if not isinstance(spec, dict):
+            continue
+        name = str(spec.get("name") or "")
+        if name != raw:
+            continue
+        role = str(spec.get("role") or "")
+        if preferred_role is None or role == preferred_role:
+            return _build_model_config(models_cfg, str(key))
+
+    if not raw.startswith("openai/"):
+        openai_name = f"openai/{raw}"
+        for key, spec in models.items():
+            if not isinstance(spec, dict):
+                continue
+            name = str(spec.get("name") or "")
+            if name != openai_name:
+                continue
+            role = str(spec.get("role") or "")
+            if preferred_role is None or role == preferred_role:
+                return _build_model_config(models_cfg, str(key))
+
+    backends = models_cfg.get("backends") or {}
+    default_backend = backends.get("lmstudio") or {}
+    suffix = "/no_think" if "thinking" in str(raw).lower() else ""
+    return ModelConfig(
+        name=str(raw),
+        base_url=str(default_backend.get("base_url", "http://localhost:1234/v1")),
+        api_key=str(default_backend.get("api_key", "lm-studio")),
+        context_window=8192,
+        max_output_tokens=1024,
+        temperature=float(default_temperature),
+        system_suffix=suffix,
+        request_timeout_s=600.0,
+        max_retries=2,
+        retry_backoff_s=2.0,
     )
 
 
@@ -158,10 +222,49 @@ def _disable_heavy_secondary_calls(config: PipelineConfig) -> PipelineConfig:
     return config
 
 
+def _task_plan_text(task: EvalTask) -> str:
+    plan = str(getattr(task, "plan", "") or "").strip()
+    if plan:
+        return plan
+    if _looks_like_rich_plan_prompt(task.description):
+        return task.description.strip()
+    return ""
+
+
+async def _maybe_attach_plan_review(
+    config: PipelineConfig,
+    task: EvalTask,
+    pipeline_result: PipelineResult | None,
+    *,
+    enabled: bool,
+) -> PipelineResult | None:
+    if not enabled or pipeline_result is None:
+        return pipeline_result
+
+    plan_text = _task_plan_text(task)
+    if not plan_text:
+        return pipeline_result
+
+    reviewer = PlanReviewer(config)
+    review = await reviewer.review(
+        PlanReviewInput(
+            plan=plan_text,
+            task=task.description,
+            execution_summary=pipeline_result.final_output,
+            changed_files=_collect_sources(pipeline_result)[
+                : int(config.plan_review_max_changed_files or 8)
+            ],
+        )
+    )
+    pipeline_result.plan_review = review
+    return pipeline_result
+
+
 async def _run_suite(
     config: PipelineConfig,
     tasks: list[EvalTask],
     *,
+    enable_plan_review: bool = False,
     checkpoint: dict[str, list[dict[str, Any]]] | None = None,
     checkpoint_key: str | None = None,
     checkpoint_path: Path | None = None,
@@ -199,6 +302,13 @@ async def _run_suite(
                 pr = await pipe.run(task.description)
                 selected_tier = 0
                 escalated = 0.0
+
+            pr = await _maybe_attach_plan_review(
+                config,
+                task,
+                pr,
+                enabled=enable_plan_review,
+            )
 
             metrics = evaluate_task(task, pr)
             sources = _collect_sources(pr)
@@ -273,6 +383,12 @@ def _serialize_results(results: list[EvalResult]) -> list[dict[str, Any]]:
                 "converged": r.pipeline_result.converged,
                 "total_latency_ms": r.pipeline_result.total_latency_ms,
             }
+            if r.pipeline_result.plan_review is not None:
+                payload["pipeline"]["plan_review"] = {
+                    "coverage_score": float(r.pipeline_result.plan_review.coverage_score or 0.0),
+                    "executed_well": bool(r.pipeline_result.plan_review.executed_well),
+                    "summary": str(r.pipeline_result.plan_review.summary or ""),
+                }
             payload["sources"] = _collect_sources(r.pipeline_result)
         out.append(payload)
     return out
@@ -388,6 +504,12 @@ def main() -> int:
         help="Backoff seconds between preload retries",
     )
     parser.add_argument(
+        "--codemap-budget",
+        type=int,
+        default=None,
+        help="Override codemap token budget (0 disables codemap)",
+    )
+    parser.add_argument(
         "--prime-index",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -398,6 +520,12 @@ def main() -> int:
         type=float,
         default=900.0,
         help="Timeout for pre-benchmark indexing wait",
+    )
+    parser.add_argument(
+        "--plan-review",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run plan review for tasks that provide a plan or rich plan prompt",
     )
     args = parser.parse_args()
 
@@ -445,11 +573,15 @@ def main() -> int:
     all_results: dict[str, list[EvalResult]] = {}
 
     for exec_key in executors:
-        executor_cfg = _build_model_config(models_cfg, exec_key)
+        executor_cfg = _build_model_config_or_id(
+            models_cfg, exec_key, preferred_role="executor", default_temperature=1.0
+        )
         if critic_key == "same":
             critic_cfg = executor_cfg
         else:
-            critic_cfg = _build_model_config(models_cfg, critic_key)
+            critic_cfg = _build_model_config_or_id(
+                models_cfg, critic_key, preferred_role="critic", default_temperature=0.0
+            )
 
         config = PipelineConfig(
             executor_model=executor_cfg,
@@ -463,17 +595,32 @@ def main() -> int:
             use_dspy_faithfulness=bool(args.dspy_faithfulness),
             enable_task_seeding=bool(args.task_seeding),
             yams_cwd=args.yams_cwd,
+            codemap_budget=(
+                int(args.codemap_budget)
+                if args.codemap_budget is not None
+                else PipelineConfig().codemap_budget
+            ),
+            codemap_max_files=5,
+            codemap_max_symbols_per_file=8,
+            codemap_include_type_counts=False,
         )
         config = _disable_heavy_secondary_calls(config)
 
         fallback_configs: list[PipelineConfig] = []
         if fallback_keys:
             for fb_key in fallback_keys:
-                fb_exec = _build_model_config(models_cfg, fb_key)
+                fb_exec = _build_model_config_or_id(
+                    models_cfg, fb_key, preferred_role="executor", default_temperature=1.0
+                )
                 fb_crit = (
                     fb_exec
                     if fallback_critic_key == "same"
-                    else _build_model_config(models_cfg, fallback_critic_key)
+                    else _build_model_config_or_id(
+                        models_cfg,
+                        fallback_critic_key,
+                        preferred_role="critic",
+                        default_temperature=0.0,
+                    )
                 )
                 fallback_configs.append(
                     _disable_heavy_secondary_calls(
@@ -489,6 +636,14 @@ def main() -> int:
                             use_dspy_faithfulness=bool(args.dspy_faithfulness),
                             enable_task_seeding=bool(args.task_seeding),
                             yams_cwd=args.yams_cwd,
+                            codemap_budget=(
+                                int(args.codemap_budget)
+                                if args.codemap_budget is not None
+                                else PipelineConfig().codemap_budget
+                            ),
+                            codemap_max_files=5,
+                            codemap_max_symbols_per_file=8,
+                            codemap_include_type_counts=False,
                         )
                     )
                 )
@@ -529,6 +684,9 @@ def main() -> int:
             "fallback_threshold": args.fallback_threshold,
             "preload_models": bool(args.preload_models),
             "prime_index": bool(args.prime_index),
+            "codemap_budget": (
+                int(args.codemap_budget) if args.codemap_budget is not None else None
+            ),
         }
         ckpt_key = _checkpoint_key(exec_key, checkpoint_payload)
 
@@ -547,6 +705,7 @@ def main() -> int:
             _run_suite(
                 config,
                 pending,
+                enable_plan_review=bool(args.plan_review),
                 checkpoint=checkpoint_data,
                 checkpoint_key=ckpt_key,
                 checkpoint_path=checkpoint_path,

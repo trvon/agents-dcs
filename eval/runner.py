@@ -65,6 +65,12 @@ class EvalRunner:
             evaluation = raw.get("evaluation") or {}
             tags = raw.get("tags") or []
 
+            plan = raw.get("plan") or ""
+            if not plan and isinstance(evaluation, dict):
+                plan = evaluation.get("plan") or evaluation.get("plan_prompt") or ""
+            if not isinstance(plan, str):
+                plan = str(plan)
+
             if not isinstance(ground_truth, dict):
                 ground_truth = {}
             if not isinstance(evaluation, dict):
@@ -77,6 +83,7 @@ class EvalRunner:
                     id=str(tid),
                     task_type=ttype,
                     description=desc.strip(),
+                    plan=plan.strip(),
                     ground_truth=ground_truth,
                     evaluation=evaluation,
                     tags=[str(t).strip() for t in tags if str(t).strip()],

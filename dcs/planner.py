@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
 from typing import Any, Protocol
+
+try:  # optional dependency
+    import dspy  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    dspy = None  # type: ignore[assignment]
 
 from dcs.types import QuerySpec, QueryType, YAMSChunk, YAMSQueryResult
 
@@ -98,9 +104,76 @@ def _is_noise_source(path: str) -> bool:
 class QueryPlanner:
     """Maps QuerySpecs to concrete YAMS executions (including expansions)."""
 
-    def __init__(self, yams: YAMSClientLike, max_concurrency: int = 0):
+    def __init__(
+        self,
+        yams: YAMSClientLike,
+        max_concurrency: int = 0,
+        *,
+        dspy_rerank_model: Any | None = None,
+        dspy_rerank_predictor: Any | None = None,
+        dspy_rerank_top_k: int = 5,
+        dspy_rerank_demos: list[dict[str, Any]] | None = None,
+        dspy_rerank_prefer_json: bool = True,
+    ):
         self._yams = yams
         self._max_concurrency = max(0, int(max_concurrency))
+        self._dspy_rerank_model = dspy_rerank_model
+        self._dspy_rerank_predictor = dspy_rerank_predictor
+        self._dspy_rerank_top_k = max(0, int(dspy_rerank_top_k))
+        self._dspy_rerank_demos = list(dspy_rerank_demos or [])
+        self._dspy_rerank_prefer_json = bool(dspy_rerank_prefer_json)
+
+    @staticmethod
+    def _build_dspy_signature() -> Any:
+        class RetrievalRerankSig(dspy.Signature):  # type: ignore[misc]
+            """Rank candidate files by relevance to the query.
+
+            Prefer source files whose path and preview align with the query intent.
+            Penalize docs, tests, benchmarks, and result artifacts unless the query explicitly asks for them.
+            Return only the candidate ids ordered best to worst.
+            """
+
+            query: str = dspy.InputField(desc="Original retrieval query")
+            max_ranked_ids: int = dspy.InputField(desc="Maximum number of candidate ids to return")
+            candidates_json: str = dspy.InputField(
+                desc="Compact JSON list of candidate files with ids, paths, and previews"
+            )
+            ranked_ids: list[int] = dspy.OutputField(
+                desc="Return only candidate ids as a JSON-style integer list, best to worst, with no prose"
+            )
+
+        return RetrievalRerankSig
+
+    @staticmethod
+    def _coerce_ranked_ids(raw: Any, limit: int) -> list[int]:
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = [int(tok) for tok in re.findall(r"\d+", raw)]
+        elif isinstance(raw, tuple):
+            raw = list(raw)
+
+        if not isinstance(raw, list):
+            return []
+
+        order: list[int] = []
+        for item in raw:
+            try:
+                val = int(item)
+            except Exception:
+                continue
+            if 1 <= val <= limit and val not in order:
+                order.append(val)
+        return order
+
+    def _dspy_adapters(self) -> list[Any]:
+        adapters: list[Any] = []
+        if self._dspy_rerank_prefer_json and hasattr(dspy, "JSONAdapter"):
+            adapters.append(dspy.JSONAdapter())
+        if hasattr(dspy, "ChatAdapter"):
+            adapters.append(dspy.ChatAdapter())
+        return adapters
 
     async def execute(
         self, specs: list[QuerySpec], *, allow_adaptive: bool = True
@@ -248,7 +321,7 @@ class QueryPlanner:
                             query=f"{q} path:{p}",
                             query_type=QueryType.GREP,
                             importance=min(1.0, float(spec.importance) + 0.05),
-                            reason=self._append_reason(spec.reason, "graph-guided grep path"),
+                            reason=self._append_reason(spec.reason, "graph-guided path"),
                         )
                     )
             elif spec.query_type == QueryType.GET:
@@ -263,7 +336,7 @@ class QueryPlanner:
                             query=p,
                             query_type=QueryType.GET,
                             importance=max(0.9, float(spec.importance)),
-                            reason=self._append_reason(spec.reason, "graph-guided get path"),
+                            reason=self._append_reason(spec.reason, "graph-guided path"),
                         )
                     )
 
@@ -342,7 +415,78 @@ class QueryPlanner:
         dt_ms = (time.perf_counter() - t0) * 1000.0
         res.latency_ms = float(res.latency_ms or dt_ms)
         res.chunks = self._rank_chunks(spec, _dedupe_chunks(res.chunks or []))
+        res.chunks = await self._maybe_dspy_rerank(spec, res.chunks)
         return res
+
+    async def _maybe_dspy_rerank(self, spec: QuerySpec, chunks: list[YAMSChunk]) -> list[YAMSChunk]:
+        if self._dspy_rerank_model is None or dspy is None:
+            return chunks
+        if spec.query_type not in {QueryType.SEMANTIC, QueryType.GREP}:
+            return chunks
+        if len(chunks) < 2:
+            return chunks
+
+        top_k = min(len(chunks), max(2, self._dspy_rerank_top_k))
+        head = list(chunks[:top_k])
+        tail = list(chunks[top_k:])
+
+        payload = []
+        for idx, chunk in enumerate(head, start=1):
+            payload.append(
+                {
+                    "id": idx,
+                    "name": self._basename(chunk.source or ""),
+                    "source": chunk.source,
+                    "preview": (chunk.content or "")[:300],
+                }
+            )
+
+        try:
+            sig = self._build_dspy_signature()
+            last_err: Exception | None = None
+            pred = None
+            for adapter in self._dspy_adapters():
+
+                def _run() -> Any:
+                    with dspy.context(lm=self._dspy_rerank_model, adapter=adapter):
+                        predictor = self._dspy_rerank_predictor
+                        if predictor is None:
+                            predictor = dspy.Predict(sig)
+                            predictor.demos = [dict(d) for d in self._dspy_rerank_demos]
+                        return predictor(
+                            query=spec.query,
+                            max_ranked_ids=top_k,
+                            candidates_json=json.dumps(payload, ensure_ascii=True),
+                        )
+
+                try:
+                    pred = await asyncio.to_thread(_run)
+                    break
+                except Exception as e:
+                    last_err = e
+                    logger.debug(
+                        "DSPy retrieval rerank adapter %s failed: %s",
+                        type(adapter).__name__,
+                        e,
+                    )
+            if pred is None:
+                if last_err is not None:
+                    raise last_err
+                return chunks
+
+            order = self._coerce_ranked_ids(getattr(pred, "ranked_ids", []) or [], len(head))
+            if not order:
+                return chunks
+
+            remaining = [i for i in range(1, len(head) + 1) if i not in order]
+            ordered = [head[i - 1] for i in order + remaining]
+            # preserve descending scores after rerank
+            for idx, chunk in enumerate(ordered):
+                chunk.score = max(0.0, min(1.0, 1.0 - (0.02 * idx)))
+            return ordered + tail
+        except Exception as e:  # pragma: no cover
+            logger.debug("DSPy retrieval rerank failed: %s", e)
+            return chunks
 
     def _rank_chunks(self, spec: QuerySpec, chunks: list[YAMSChunk]) -> list[YAMSChunk]:
         if not chunks:

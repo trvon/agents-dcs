@@ -30,6 +30,28 @@ from dcs.types import (
 logger = logging.getLogger(__name__)
 
 
+_SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>[\s\S]*?</system-reminder>", re.IGNORECASE)
+_ORPHAN_SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>[\s\S]*$", re.IGNORECASE)
+_PLAN_SECTION_TYPES = {
+    "assumption": "assumption",
+    "assumptions": "assumption",
+    "tests first": "required_step",
+    "minimum safe change set": "required_step",
+    "benchmark cases to rerun": "benchmark",
+    "benchmark cases": "benchmark",
+    "acceptance gates": "acceptance_gate",
+    "what's covered now": "evidence",
+    "what is covered now": "evidence",
+    "what still blocks": "gap",
+    "what still blocks end-to-end confidence": "gap",
+    "what's still blocked": "gap",
+    "what is still blocked": "gap",
+    "what we decide after that": "decision_branch",
+}
+
+_NON_EXECUTABLE_STEP_TYPES = {"evidence", "gap", "decision_branch"}
+
+
 def _clamp01(x: float) -> float:
     try:
         xf = float(x)
@@ -42,15 +64,65 @@ def _clamp01(x: float) -> float:
     return xf
 
 
+def _strip_system_reminders(text: str) -> str:
+    cleaned = _SYSTEM_REMINDER_RE.sub("\n", text or "")
+    cleaned = _ORPHAN_SYSTEM_REMINDER_RE.sub("\n", cleaned)
+    return cleaned.strip()
+
+
+def _canonical_section_name(line: str) -> str:
+    raw = re.sub(r":+$", "", (line or "").strip())
+    key = raw.replace("’", "'").replace("`", "'")
+    key = re.sub(r"\s+", " ", key).strip().lower()
+    if key in _PLAN_SECTION_TYPES:
+        return raw.strip()
+    return ""
+
+
+def _section_step_type(section: str) -> str:
+    key = (section or "").strip().replace("’", "'").replace("`", "'")
+    key = re.sub(r"\s+", " ", key).strip().lower()
+    return _PLAN_SECTION_TYPES.get(key, "step")
+
+
+def _counts_for_coverage(step: PlanStep) -> bool:
+    return step.step_type not in _NON_EXECUTABLE_STEP_TYPES
+
+
+def _looks_like_rich_plan_prompt(text: str) -> bool:
+    cleaned = _strip_system_reminders(text or "")
+    if not cleaned:
+        return False
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    section_hits = sum(1 for line in lines if _canonical_section_name(line))
+    numbered_hits = sum(1 for line in lines if re.match(r"^\d+[.)]\s+", line))
+    bullet_hits = sum(1 for line in lines if re.match(r"^[-*]\s+", line))
+    if section_hits >= 1 and (numbered_hits >= 1 or bullet_hits >= 3):
+        return True
+    return section_hits >= 2 or numbered_hits >= 3
+
+
+def _derive_task_from_plan_text(plan: str, steps: list[PlanStep]) -> str:
+    for preferred in ("required_step", "benchmark", "acceptance_gate", "assumption", "step"):
+        for step in steps:
+            if step.step_type == preferred and step.description.strip():
+                return step.description.strip()[:240]
+    cleaned = _strip_system_reminders(plan or "")
+    first_line = next((line.strip() for line in cleaned.splitlines() if line.strip()), "")
+    return first_line[:240]
+
+
 def parse_plan_steps(plan: str) -> list[PlanStep]:
-    text = (plan or "").strip()
+    text = _strip_system_reminders(plan or "")
     if not text:
         return []
 
     steps: list[PlanStep] = []
     current: list[str] = []
     current_id = 0
+    current_section = ""
     bullet_re = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+(.*\S)\s*$")
+    numbered_re = re.compile(r"^\s*(\d+[.)])\s+(.*\S)\s*$")
 
     def flush() -> None:
         nonlocal current, current_id
@@ -63,6 +135,8 @@ def parse_plan_steps(plan: str) -> list[PlanStep]:
             PlanStep(
                 step_id=f"step-{current_id}",
                 description=description,
+                section=current_section,
+                step_type=_section_step_type(current_section),
                 acceptance_criteria=acceptance,
             )
         )
@@ -70,18 +144,32 @@ def parse_plan_steps(plan: str) -> list[PlanStep]:
 
     for raw in text.splitlines():
         line = raw.rstrip()
+        stripped = line.strip()
         if not line.strip():
             flush()
             continue
+        section_name = _canonical_section_name(stripped)
+        if section_name:
+            flush()
+            current_section = section_name
+            continue
         m = bullet_re.match(line)
         if m:
-            flush()
-            current = [m.group(1).strip()]
+            if numbered_re.match(line):
+                flush()
+                current = [m.group(1).strip()]
+            elif _section_step_type(current_section) in {"evidence", "gap"}:
+                flush()
+                current = [m.group(1).strip()]
+            elif current:
+                current.append(m.group(1).strip())
+            else:
+                current = [m.group(1).strip()]
             continue
         if current:
-            current.append(line.strip())
+            current.append(stripped)
         else:
-            current = [line.strip()]
+            current = [stripped]
     flush()
 
     if steps:
@@ -149,18 +237,113 @@ class PlanReviewer:
         return kwargs
 
     def _normalize_input(self, review_input: PlanReviewInput) -> PlanReviewInput:
+        plan_text = _strip_system_reminders(review_input.plan)
+        task_text = str(review_input.task or "")
+        if not plan_text and _looks_like_rich_plan_prompt(task_text):
+            plan_text = _strip_system_reminders(task_text)
+            task_text = _derive_task_from_plan_text(plan_text, parse_plan_steps(plan_text))
         files = [str(p).strip() for p in review_input.changed_files if str(p).strip()]
         if not files and review_input.diff_text:
             files = _extract_changed_files_from_diff(review_input.diff_text)
         max_files = max(1, int(self.config.plan_review_max_changed_files or 8))
         return PlanReviewInput(
-            plan=review_input.plan,
-            task=review_input.task,
+            plan=plan_text,
+            task=task_text,
             diff_text=review_input.diff_text,
             change_summary=review_input.change_summary,
             execution_summary=review_input.execution_summary,
             changed_files=files[:max_files],
         )
+
+    def _build_plan_normalization_prompt(self, plan: str) -> list[dict[str, Any]]:
+        schema = {
+            "task_summary": "string",
+            "steps": [
+                {
+                    "section": "string",
+                    "step_type": "assumption|required_step|benchmark|acceptance_gate|decision_branch|evidence|gap|step",
+                    "description": "string",
+                    "acceptance_criteria": ["string"],
+                }
+            ],
+        }
+        sys = (
+            "You normalize implementation plans into structured execution steps. "
+            "Return JSON only. Preserve intent, but remove control metadata and wrapper text."
+        )
+        user = (
+            "Normalize this plan-like prompt into execution-ready steps.\n\n"
+            "Rules:\n"
+            "- Keep assumptions as assumption steps.\n"
+            "- Keep acceptance gates as acceptance_gate steps.\n"
+            "- Keep completed-work/status sections as evidence steps, not executable requirements.\n"
+            "- Keep blocker/risk sections as gap steps, not completed work.\n"
+            "- Keep conditional future decisions as decision_branch steps.\n"
+            "- For numbered sections, keep one top-level step per numbered item and fold nested bullets into acceptance_criteria.\n"
+            "- Ignore <system-reminder> content if present.\n\n"
+            f"Return JSON with schema:\n{json.dumps(schema, indent=2)}\n\n"
+            f"PLAN:\n{_strip_system_reminders(plan)}"
+        )
+        return [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user},
+        ]
+
+    def _parse_normalized_plan_response(self, data: dict[str, Any]) -> tuple[str, list[PlanStep]]:
+        task_summary = str(data.get("task_summary") or "").strip()
+        raw_steps = data.get("steps") or []
+        steps: list[PlanStep] = []
+        if isinstance(raw_steps, list):
+            for idx, item in enumerate(raw_steps, start=1):
+                if not isinstance(item, dict):
+                    continue
+                desc = str(item.get("description") or "").strip()
+                if not desc:
+                    continue
+                section = str(item.get("section") or "").strip()
+                step_type = (
+                    str(item.get("step_type") or _section_step_type(section)).strip() or "step"
+                )
+                criteria = item.get("acceptance_criteria") or []
+                if not isinstance(criteria, list):
+                    criteria = []
+                steps.append(
+                    PlanStep(
+                        step_id=f"step-{idx}",
+                        description=desc,
+                        section=section,
+                        step_type=step_type,
+                        acceptance_criteria=[str(x).strip() for x in criteria if str(x).strip()],
+                    )
+                )
+        return task_summary, steps
+
+    async def _normalize_plan_with_model(
+        self, review_input: PlanReviewInput, fallback_steps: list[PlanStep]
+    ) -> tuple[str, list[PlanStep]]:
+        if not _looks_like_rich_plan_prompt(review_input.plan):
+            return review_input.task, fallback_steps
+
+        critic_cfg: ModelConfig = self.config.critic_model or self.config.executor_model
+        executor = ModelExecutor(critic_cfg)
+        messages = self._build_plan_normalization_prompt(review_input.plan)
+        try:
+            exec_result = await executor.execute_raw(
+                messages,
+                model=critic_cfg.name,
+                temperature=0.0,
+                max_tokens=min(int(critic_cfg.max_output_tokens or 1024), 1600),
+            )
+            raw_output = exec_result.output or ""
+            blob = _extract_first_json_object(raw_output or "")
+            parsed = _try_parse_json(blob or raw_output or "")
+            if isinstance(parsed, dict):
+                task_summary, steps = self._parse_normalized_plan_response(parsed)
+                if steps:
+                    return task_summary or review_input.task, steps
+        except Exception as e:
+            logger.debug("Plan normalization model call failed: %s", e)
+        return review_input.task, fallback_steps
 
     def _build_queries(
         self, task: str, steps: list[PlanStep], changed_files: list[str]
@@ -307,13 +490,22 @@ class PlanReviewer:
         ).lower()
         step_reviews: list[PlanStepReview] = []
         completed = 0
+        coverage_steps = [step for step in steps if _counts_for_coverage(step)]
         gaps: list[str] = []
         for step in steps:
             tokens = [
                 t.lower() for t in re.findall(r"[A-Za-z0-9_./-]+", step.description) if len(t) >= 4
             ]
             hits = sum(1 for token in tokens[:8] if token in haystack)
-            if tokens and hits >= max(1, len(tokens[:4]) // 2):
+            if step.step_type == "evidence":
+                status = PlanStepStatus.COMPLETE if hits > 0 else PlanStepStatus.UNVERIFIED
+            elif step.step_type == "gap":
+                status = PlanStepStatus.PARTIAL if hits > 0 else PlanStepStatus.MISSING
+                if hits > 0:
+                    gaps.append(f"Blocker still present: {step.description}")
+                else:
+                    gaps.append(f"Gap remains open: {step.description}")
+            elif tokens and hits >= max(1, len(tokens[:4]) // 2):
                 status = PlanStepStatus.COMPLETE
                 completed += 1
             elif hits > 0:
@@ -321,7 +513,8 @@ class PlanReviewer:
                 gaps.append(f"Partial evidence for: {step.description}")
             else:
                 status = PlanStepStatus.MISSING
-                gaps.append(f"No clear evidence for: {step.description}")
+                if _counts_for_coverage(step):
+                    gaps.append(f"No clear evidence for: {step.description}")
             step_reviews.append(
                 PlanStepReview(
                     step_id=step.step_id,
@@ -335,17 +528,29 @@ class PlanReviewer:
                 )
             )
 
-        coverage = completed / max(1, len(steps)) if steps else 0.0
+        coverage = completed / max(1, len(coverage_steps)) if coverage_steps else 0.0
         sources: list[str] = []
         for qr in query_results:
             for chunk in qr.chunks:
                 if chunk.source and chunk.source not in sources:
                     sources.append(chunk.source)
         advice = ["Add targeted verification for any partially implemented steps."] if gaps else []
-        tests = [
-            f"Add regression test for {step.description}" for step in steps[:2] if step.description
-        ]
-        followup = [gap for gap in gaps[:3]]
+        tests: list[str] = []
+        for step in steps:
+            if step.step_type in {"required_step", "acceptance_gate", "step"} and step.description:
+                tests.append(f"Add regression test for {step.description}")
+            elif step.step_type == "benchmark" and step.description:
+                tests.append(f"Rerun benchmark case: {step.description}")
+            if len(tests) >= 3:
+                break
+        followup: list[str] = []
+        for step in steps:
+            if step.step_type == "gap" and step.description:
+                followup.append(step.description)
+        for gap in gaps:
+            if gap not in followup:
+                followup.append(gap)
+        followup = followup[:3]
         return PlanReviewResult(
             task=review_input.task or "",
             plan_steps=steps,
@@ -432,6 +637,9 @@ class PlanReviewer:
         start = time.perf_counter()
         normalized = self._normalize_input(review_input)
         steps = parse_plan_steps(normalized.plan)
+        normalized_task, steps = await self._normalize_plan_with_model(normalized, steps)
+        if normalized_task:
+            normalized.task = normalized_task
         change_summary = build_change_summary(normalized)
         query_results: list[YAMSQueryResult] = []
         context = ContextBlock(content="", budget=self.config.plan_review_context_budget)

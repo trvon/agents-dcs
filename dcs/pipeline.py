@@ -5,6 +5,11 @@ import time
 from dataclasses import asdict
 from typing import Any
 
+try:  # optional dependency
+    import dspy  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    dspy = None  # type: ignore[assignment]
+
 from rich.console import Console
 from rich.table import Table
 
@@ -158,6 +163,35 @@ class DCSPipeline:
             self.console.print(
                 "[dim]Context profile=large applied: " + ", ".join(changed) + "[/dim]"
             )
+
+    def _build_dspy_retrieval_model(self) -> Any | None:
+        if not self.config.use_dspy_retrieval_rerank or dspy is None:
+            return None
+        model_cfg = (
+            self.config.dspy_retrieval_model
+            or self.config.critic_model
+            or self.config.executor_model
+        )
+        candidates = [model_cfg.name]
+        if not model_cfg.name.startswith("openai/"):
+            candidates.append(f"openai/{model_cfg.name}")
+        last_err: Exception | None = None
+        for model_name in candidates:
+            try:
+                return dspy.LM(
+                    model_name,
+                    api_base=model_cfg.base_url,
+                    api_key=model_cfg.api_key,
+                    temperature=0.0,
+                    max_tokens=max(128, int(self.config.dspy_retrieval_max_tokens or 16384)),
+                    timeout=float(model_cfg.request_timeout_s),
+                )
+            except Exception as e:  # pragma: no cover
+                last_err = e
+                continue
+        if last_err is not None:
+            self.console.print(f"[dim]DSPy retrieval rerank unavailable: {last_err}[/dim]")
+        return None
 
     def _prepend_codemap(
         self,
@@ -466,9 +500,13 @@ class DCSPipeline:
             async with self._init_client(weights) as client:
                 executor = ModelExecutor(self.config.executor_model)
                 decomposer = TaskDecomposer(self.config.executor_model)
+                dspy_retrieval_model = self._build_dspy_retrieval_model()
                 planner = QueryPlanner(
                     client,
                     max_concurrency=int(self.config.retrieval_max_concurrency),
+                    dspy_rerank_model=dspy_retrieval_model,
+                    dspy_rerank_top_k=int(self.config.dspy_retrieval_top_k),
+                    dspy_rerank_prefer_json=bool(self.config.dspy_retrieval_prefer_json),
                 )
                 assembler = ContextAssembler(
                     budget=self.config.context_budget, model=self.config.executor_model.name
@@ -485,8 +523,11 @@ class DCSPipeline:
                         codemap_builder = CodemapBuilder(
                             client,
                             token_budget=self.config.codemap_budget,
-                            max_files=30,
-                            max_symbols_per_file=15,
+                            max_files=max(1, int(self.config.codemap_max_files)),
+                            max_symbols_per_file=max(
+                                1, int(self.config.codemap_max_symbols_per_file)
+                            ),
+                            include_type_counts=bool(self.config.codemap_include_type_counts),
                         )
                         codemap_result = await codemap_builder.build(task=task)
                         codemap_prefix = codemap_result.tree_text

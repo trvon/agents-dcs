@@ -123,6 +123,22 @@ class _StageStubYAMS:
         return YAMSQueryResult(spec=spec, chunks=[])
 
 
+class _FakeDSPyPredictor:
+    last_demos = None
+
+    def __init__(self):
+        self.demos = []
+
+    def __call__(self, **kwargs):
+        _FakeDSPyPredictor.last_demos = list(self.demos)
+
+        class _Pred:
+            ranked_ids = "[2, 1]"
+            rationale = "prefer second file"
+
+        return _Pred()
+
+
 @pytest.mark.asyncio
 async def test_execute_runs_search_then_graph_then_grep_get() -> None:
     yams = _StageStubYAMS()
@@ -192,3 +208,65 @@ def test_top_graph_paths_prefers_related_neighbors() -> None:
 
     ranked = planner._top_graph_paths(graph_results, limit=2)
     assert ranked[0] == "/repo/include/yams/mcp/tool_registry.h"
+
+
+@pytest.mark.asyncio
+async def test_maybe_dspy_rerank_reorders_top_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    import dcs.planner as planner_mod
+
+    class _FakeDSPy:
+        last_context = None
+
+        class Signature:
+            pass
+
+        class InputField:
+            def __init__(self, **kwargs):
+                pass
+
+        class OutputField:
+            def __init__(self, **kwargs):
+                pass
+
+        class ChatAdapter:
+            pass
+
+        class JSONAdapter:
+            pass
+
+        class _Context:
+            def __init__(self, **kwargs):
+                _FakeDSPy.last_context = kwargs
+
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        @staticmethod
+        def context(**kwargs):
+            return _FakeDSPy._Context(**kwargs)
+
+        @staticmethod
+        def Predict(sig):
+            return _FakeDSPyPredictor()
+
+    monkeypatch.setattr(planner_mod, "dspy", _FakeDSPy)
+    planner = QueryPlanner(
+        _StubYAMS(),
+        dspy_rerank_model=object(),
+        dspy_rerank_top_k=2,
+        dspy_rerank_demos=[
+            {"query": "demo", "max_ranked_ids": 2, "candidates_json": "[]", "ranked_ids": [1]}
+        ],
+    )
+    spec = QuerySpec(query="EmbeddingService", query_type=QueryType.SEMANTIC, importance=0.9)
+    chunks = [
+        YAMSChunk(chunk_id="1", content="one", score=0.9, source="/repo/src/a.cpp"),
+        YAMSChunk(chunk_id="2", content="two", score=0.8, source="/repo/src/b.cpp"),
+    ]
+    ranked = await planner._maybe_dspy_rerank(spec, chunks)
+    assert ranked[0].source == "/repo/src/b.cpp"
+    assert type(_FakeDSPy.last_context["adapter"]).__name__ == "JSONAdapter"
+    assert _FakeDSPyPredictor.last_demos and _FakeDSPyPredictor.last_demos[0]["query"] == "demo"

@@ -33,6 +33,29 @@ def _is_noise_source(path: str) -> bool:
     return p.endswith((".md", ".txt", ".json", ".yaml", ".yml", ".lock"))
 
 
+def _is_code_source(path: str) -> bool:
+    p = (path or "").lower()
+    if not p:
+        return False
+    return p.endswith(
+        (
+            ".cpp",
+            ".c",
+            ".cc",
+            ".cxx",
+            ".h",
+            ".hpp",
+            ".py",
+            ".rs",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".go",
+            ".java",
+        )
+    )
+
+
 class YAMSClientError(RuntimeError):
     pass
 
@@ -554,6 +577,131 @@ class YAMSClient:
                 except Exception:
                     return {"text": text}
         return tool_result
+
+    @staticmethod
+    def _query_terms(query: str) -> list[str]:
+        out: list[str] = []
+        for token in _re.findall(r"[A-Za-z0-9_./-]+", query or ""):
+            raw = token.strip("._/-")
+            lower = raw.lower()
+            if len(lower) < 3:
+                continue
+            if lower in {
+                "what",
+                "does",
+                "used",
+                "use",
+                "with",
+                "from",
+                "that",
+                "this",
+                "how",
+                "list",
+                "each",
+                "focus",
+                "explain",
+                "describe",
+                "work",
+                "works",
+            }:
+                continue
+            if lower not in out:
+                out.append(lower)
+            camel_parts = _re.findall(r"[A-Z]?[a-z]+|[0-9]+", raw)
+            for part in camel_parts:
+                part_l = part.lower()
+                if len(part_l) >= 3 and part_l not in out:
+                    out.append(part_l)
+            for part in _re.findall(r"[a-z]+|[0-9]+", lower.replace("_", "-")):
+                if len(part) >= 3 and part not in out:
+                    out.append(part)
+        return out
+
+    @staticmethod
+    def _identifier_terms(text: str) -> list[str]:
+        out: list[str] = []
+        for token in _re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text or ""):
+            lower = token.lower()
+            if len(lower) < 3:
+                continue
+            if lower not in out:
+                out.append(lower)
+            camel_parts = _re.findall(r"[A-Z]?[a-z]+|[0-9]+", token)
+            for part in camel_parts:
+                part_l = part.lower()
+                if len(part_l) >= 3 and part_l not in out:
+                    out.append(part_l)
+        return out
+
+    @staticmethod
+    def _code_relevance_score(query: str, chunk: YAMSChunk) -> float:
+        source = (chunk.source or "").strip()
+        source_l = source.lower()
+        content = chunk.content or ""
+        content_l = content.lower()
+        q_terms = YAMSClient._query_terms(query)
+        if not q_terms:
+            return float(chunk.score or 0.0)
+
+        score = float(chunk.score or 0.0)
+        if source:
+            if _is_code_source(source):
+                score += 0.18
+            if _is_noise_source(source):
+                score -= 0.35
+            if "/src/" in source_l or "/include/" in source_l:
+                score += 0.08
+            if "/external/agent/results/" in source_l or "/eval/tasks/" in source_l:
+                score -= 0.40
+
+        path_terms = set(YAMSClient._identifier_terms(source))
+        content_terms = set(YAMSClient._identifier_terms(content))
+        direct_hits = 0
+        identifier_hits = 0
+        partial_hits = 0
+        basename = Path(source).name.lower() if source else ""
+
+        for term in q_terms[:16]:
+            if source_l and term in source_l:
+                direct_hits += 1
+            if term in path_terms or term in content_terms:
+                identifier_hits += 1
+            elif basename and term in basename:
+                partial_hits += 1
+
+        score += min(0.30, 0.08 * direct_hits)
+        score += min(0.28, 0.07 * identifier_hits)
+        score += min(0.08, 0.04 * partial_hits)
+
+        query_file = None
+        m = _re.search(r"([A-Za-z_][\w\-]*\.[A-Za-z0-9]{1,8})", (query or "").lower())
+        if m:
+            query_file = m.group(1)
+        if query_file and query_file in basename:
+            score += 0.25
+
+        if "# " in content[:4] and "matches" in content[:80]:
+            score += 0.03
+        if "line=" in content_l or "char=" in content_l:
+            score += 0.03
+
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _rerank_code_chunks(
+        query: str, chunks: list[YAMSChunk], *, limit: int | None = None
+    ) -> list[YAMSChunk]:
+        rescored: list[tuple[float, int, YAMSChunk]] = []
+        for idx, chunk in enumerate(chunks):
+            rescored.append((YAMSClient._code_relevance_score(query, chunk), idx, chunk))
+        rescored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        ordered = []
+        for score, _, chunk in rescored:
+            chunk.score = score
+            ordered.append(chunk)
+        if limit is not None:
+            return ordered[: max(0, int(limit))]
+        return ordered
 
     @staticmethod
     def _chunks_from_search_data(data: Any) -> list[YAMSChunk]:
@@ -1171,20 +1319,6 @@ class YAMSClient:
         if not chunks:
             return 0.0
 
-        code_exts = {
-            ".cpp",
-            ".c",
-            ".cc",
-            ".cxx",
-            ".h",
-            ".hpp",
-            ".py",
-            ".rs",
-            ".ts",
-            ".js",
-            ".go",
-            ".java",
-        }
         q_l = (query or "").lower()
         q_file = None
         m = _re.search(r"([A-Za-z_][\w\-]*\.[A-Za-z0-9]{1,8})", q_l)
@@ -1202,7 +1336,7 @@ class YAMSClient:
             src = (c.source or "").strip()
             src_l = src.lower()
             if src:
-                if Path(src).suffix.lower() in code_exts:
+                if _is_code_source(src):
                     code_ratio += 1.0
                 if _is_noise_source(src):
                     noise_ratio += 1.0
@@ -1256,6 +1390,7 @@ class YAMSClient:
                     if not c.source or self._source_matches_filters(c.source, cwd=self._cwd)
                 ]
                 self._backfill_positional_scores(chunks)
+                chunks = self._rerank_code_chunks(query, chunks, limit=limit)
                 q = self._search_result_quality(chunks, query)
                 candidates.append((q, t, chunks))
 
@@ -1278,6 +1413,7 @@ class YAMSClient:
                         if not c.source or self._source_matches_filters(c.source, cwd=self._cwd)
                     ]
                     self._backfill_positional_scores(chunks)
+                    chunks = self._rerank_code_chunks(query, chunks, limit=limit)
                     q = self._search_result_quality(chunks, query)
                     candidates.append((q, f"cli:{t}", chunks))
                     if not requested_type and t == "hybrid":
@@ -1335,7 +1471,7 @@ class YAMSClient:
         # Assign positional scores so the assembler can rank earlier
         # (more relevant) matches higher.
         self._backfill_positional_scores(chunks)
-        return chunks
+        return self._rerank_code_chunks(pattern, chunks)
 
     @staticmethod
     def _split_grep_pattern(pattern: str) -> tuple[str, str | None, list[str], list[str]]:

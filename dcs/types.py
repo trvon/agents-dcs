@@ -171,6 +171,8 @@ class PlanStep:
 
     step_id: str
     description: str
+    section: str = ""
+    step_type: str = "step"
     acceptance_criteria: list[str] = field(default_factory=list)
 
 
@@ -315,6 +317,9 @@ class PipelineConfig:
     system_prompt_budget: int = 512  # tokens for system prompt
     output_reserve: int = 1024  # tokens reserved for model output
     codemap_budget: int = 256  # tokens reserved for structural codemap prefix
+    codemap_max_files: int = 5
+    codemap_max_symbols_per_file: int = 8
+    codemap_include_type_counts: bool = False
     min_context_budget: int = 128  # lower bound for overflow retries
     min_output_tokens: int = 256  # lower bound for overflow retries
     context_shrink_factor: float = 0.7  # shrink multiplier on overflow retry
@@ -336,6 +341,17 @@ class PipelineConfig:
     max_chunks_per_query: int = 10
     min_chunk_score: float = 0.1
     retrieval_max_concurrency: int = 2
+    use_dspy_retrieval_rerank: bool = False
+    dspy_retrieval_top_k: int = 5
+    dspy_retrieval_max_tokens: int = 16384
+    dspy_retrieval_demo_count: int = 0
+    dspy_retrieval_prefer_json: bool = True
+    dspy_retrieval_optimize: bool = False
+    dspy_retrieval_optimizer_trainset_size: int = 6
+    dspy_retrieval_bootstrapped_demos: int = 2
+    dspy_retrieval_labeled_demos: int = 4
+    dspy_retrieval_metric_threshold: float = 0.75
+    dspy_retrieval_model: ModelConfig | None = None
 
     # Iteration settings
     max_iterations: int = 3
@@ -402,6 +418,7 @@ class EvalTask:
     id: str
     task_type: TaskType
     description: str
+    plan: str = ""
     ground_truth: dict[str, Any] = field(default_factory=dict)
     evaluation: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)

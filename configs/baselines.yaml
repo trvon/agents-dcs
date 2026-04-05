@@ -34,8 +34,8 @@ experiments:
         model: gemma-27b
         scaffolded: false
         max_iterations: 1
-      - name: "ceiling-120b"
-        model: gpt-oss-120b
+      - name: "ceiling-122b"
+        model: qwen-122b
         scaffolded: false
         max_iterations: 1
 
