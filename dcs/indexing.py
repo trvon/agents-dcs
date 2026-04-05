@@ -8,7 +8,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_INDEX_INCLUDE = "*.cpp,*.hpp,*.h,*.cc,*.cxx,*.c,*.py,*.md,*.yaml,*.yml,*.toml"
 DEFAULT_INDEX_EXCLUDE = ".git/**,build/**,dist/**,.venv/**,venv/**,__pycache__/**,node_modules/**"
 

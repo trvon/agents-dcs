@@ -7,6 +7,10 @@ backends:
     base_url: "http://localhost:1234/v1"
     api_key: "lm-studio"
 
+  llama_cpp:
+    base_url: "http://127.0.0.1:8080/v1"
+    api_key: "llama.cpp"
+
   ollama:
     base_url: "http://localhost:11434/v1"
     api_key: "ollama"
@@ -121,6 +125,28 @@ models:
     temperature: 0.0
     role: critic
     request_timeout_s: 240
+    max_retries: 2
+    retry_backoff_s: 2.0
+
+  gemma4-executor:
+    backend: llama_cpp
+    name: "gemma4"
+    context_window: 32768
+    max_output_tokens: 4096
+    temperature: 1.0
+    role: executor
+    request_timeout_s: 300
+    max_retries: 2
+    retry_backoff_s: 2.0
+
+  gemma4-critic:
+    backend: llama_cpp
+    name: "gemma4"
+    context_window: 32768
+    max_output_tokens: 2048
+    temperature: 0.0
+    role: critic
+    request_timeout_s: 300
     max_retries: 2
     retry_backoff_s: 2.0
 

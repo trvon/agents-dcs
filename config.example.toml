@@ -1,0 +1,7 @@
+[paths]
+config_dir = "configs"
+task_dir = "eval/tasks"
+yams_cwd = "../.."
+
+[debug]
+critic_debug_dir = ""

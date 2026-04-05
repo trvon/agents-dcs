@@ -7,8 +7,6 @@ MCP stdio transport: newline-delimited JSON-RPC 2.0 messages.
 from __future__ import annotations
 
 import asyncio
-import fnmatch
-import hashlib
 import json
 import logging
 import os
@@ -19,41 +17,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .client_grep import (
+    chunks_from_structured_grep_matches,
+    enrich_grep_results,
+    parse_grep_file_paths,
+    read_file_context,
+    source_matches_filters,
+    structured_grep_matches,
+)
+from .client_parsing import (
+    code_relevance_score,
+    extract_tool_data,
+    get_str,
+    identifier_terms,
+    is_code_source,
+    maybe_path_like,
+    normalize_search_source,
+    query_terms,
+    rerank_code_chunks,
+)
+from .shared import is_noise_source
 from .types import QuerySpec, QueryType, YAMSChunk, YAMSQueryResult
 
 logger = logging.getLogger(__name__)
-
-
-def _is_noise_source(path: str) -> bool:
-    p = (path or "").lower()
-    if not p:
-        return False
-    if "/tests/" in p or "/docs/" in p or "/benchmarks/" in p:
-        return True
-    return p.endswith((".md", ".txt", ".json", ".yaml", ".yml", ".lock"))
-
-
-def _is_code_source(path: str) -> bool:
-    p = (path or "").lower()
-    if not p:
-        return False
-    return p.endswith(
-        (
-            ".cpp",
-            ".c",
-            ".cc",
-            ".cxx",
-            ".h",
-            ".hpp",
-            ".py",
-            ".rs",
-            ".ts",
-            ".tsx",
-            ".js",
-            ".go",
-            ".java",
-        )
-    )
 
 
 class YAMSClientError(RuntimeError):
@@ -475,44 +461,11 @@ class YAMSClient:
 
     @staticmethod
     def _maybe_path_like(text: str) -> str | None:
-        raw = (text or "").strip().strip("\"'")
-        if not raw:
-            return None
-        if "\n" in raw:
-            raw = raw.splitlines()[0].strip().strip("\"'")
-        if not (
-            "/" in raw
-            or raw.endswith(
-                (
-                    ".cpp",
-                    ".cc",
-                    ".cxx",
-                    ".c",
-                    ".h",
-                    ".hpp",
-                    ".py",
-                    ".rs",
-                    ".ts",
-                    ".js",
-                    ".go",
-                    ".java",
-                )
-            )
-        ):
-            return None
-        return raw
+        return maybe_path_like(text)
 
     @staticmethod
     def _normalize_search_source(path: str, snippet: str, title: str = "") -> str:
-        src = (path or "").strip()
-        if src and not _is_noise_source(src):
-            return src
-
-        for candidate in (snippet, title):
-            maybe = YAMSClient._maybe_path_like(candidate)
-            if maybe and not _is_noise_source(maybe):
-                return maybe
-        return src
+        return normalize_search_source(path, snippet, title)
 
     async def _cli_json(self, argv: list[str], *, timeout_s: float | None = None) -> Any:
         env = os.environ.copy()
@@ -530,10 +483,10 @@ class YAMSClient:
         timeout = self._request_timeout_s if timeout_s is None else float(timeout_s)
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except TimeoutError:
+        except TimeoutError as err:
             proc.kill()
             await proc.communicate()
-            raise TimeoutError(f"Timed out waiting for CLI response: {' '.join(argv)}")
+            raise TimeoutError(f"Timed out waiting for CLI response: {' '.join(argv)}") from err
 
         if proc.returncode != 0:
             detail = (
@@ -552,156 +505,29 @@ class YAMSClient:
 
     @staticmethod
     def _get_str(mapping: dict[str, Any], key: str) -> str:
-        val = mapping.get(key)
-        return val if isinstance(val, str) else ""
+        return get_str(mapping, key)
 
     @staticmethod
     def _extract_tool_data(tool_result: dict[str, Any]) -> Any:
-        if not isinstance(tool_result, dict):
-            return tool_result
-
-        sc = tool_result.get("structuredContent")
-        if isinstance(sc, dict) and sc:
-            if any(k in sc for k in ("results", "matches", "documents", "paths", "ready", "steps")):
-                return sc
-        if isinstance(sc, dict) and isinstance(sc.get("data"), (dict, list, str, int, float, bool)):
-            return sc.get("data")
-
-        content = tool_result.get("content")
-        if isinstance(content, list) and content:
-            first = content[0]
-            if isinstance(first, dict) and isinstance(first.get("text"), str):
-                text = first["text"]
-                try:
-                    return json.loads(text)
-                except Exception:
-                    return {"text": text}
-        return tool_result
+        return extract_tool_data(tool_result)
 
     @staticmethod
     def _query_terms(query: str) -> list[str]:
-        out: list[str] = []
-        for token in _re.findall(r"[A-Za-z0-9_./-]+", query or ""):
-            raw = token.strip("._/-")
-            lower = raw.lower()
-            if len(lower) < 3:
-                continue
-            if lower in {
-                "what",
-                "does",
-                "used",
-                "use",
-                "with",
-                "from",
-                "that",
-                "this",
-                "how",
-                "list",
-                "each",
-                "focus",
-                "explain",
-                "describe",
-                "work",
-                "works",
-            }:
-                continue
-            if lower not in out:
-                out.append(lower)
-            camel_parts = _re.findall(r"[A-Z]?[a-z]+|[0-9]+", raw)
-            for part in camel_parts:
-                part_l = part.lower()
-                if len(part_l) >= 3 and part_l not in out:
-                    out.append(part_l)
-            for part in _re.findall(r"[a-z]+|[0-9]+", lower.replace("_", "-")):
-                if len(part) >= 3 and part not in out:
-                    out.append(part)
-        return out
+        return query_terms(query)
 
     @staticmethod
     def _identifier_terms(text: str) -> list[str]:
-        out: list[str] = []
-        for token in _re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text or ""):
-            lower = token.lower()
-            if len(lower) < 3:
-                continue
-            if lower not in out:
-                out.append(lower)
-            camel_parts = _re.findall(r"[A-Z]?[a-z]+|[0-9]+", token)
-            for part in camel_parts:
-                part_l = part.lower()
-                if len(part_l) >= 3 and part_l not in out:
-                    out.append(part_l)
-        return out
+        return identifier_terms(text)
 
     @staticmethod
     def _code_relevance_score(query: str, chunk: YAMSChunk) -> float:
-        source = (chunk.source or "").strip()
-        source_l = source.lower()
-        content = chunk.content or ""
-        content_l = content.lower()
-        q_terms = YAMSClient._query_terms(query)
-        if not q_terms:
-            return float(chunk.score or 0.0)
-
-        score = float(chunk.score or 0.0)
-        if source:
-            if _is_code_source(source):
-                score += 0.18
-            if _is_noise_source(source):
-                score -= 0.35
-            if "/src/" in source_l or "/include/" in source_l:
-                score += 0.08
-            if "/external/agent/results/" in source_l or "/eval/tasks/" in source_l:
-                score -= 0.40
-
-        path_terms = set(YAMSClient._identifier_terms(source))
-        content_terms = set(YAMSClient._identifier_terms(content))
-        direct_hits = 0
-        identifier_hits = 0
-        partial_hits = 0
-        basename = Path(source).name.lower() if source else ""
-
-        for term in q_terms[:16]:
-            if source_l and term in source_l:
-                direct_hits += 1
-            if term in path_terms or term in content_terms:
-                identifier_hits += 1
-            elif basename and term in basename:
-                partial_hits += 1
-
-        score += min(0.30, 0.08 * direct_hits)
-        score += min(0.28, 0.07 * identifier_hits)
-        score += min(0.08, 0.04 * partial_hits)
-
-        query_file = None
-        m = _re.search(r"([A-Za-z_][\w\-]*\.[A-Za-z0-9]{1,8})", (query or "").lower())
-        if m:
-            query_file = m.group(1)
-        if query_file and query_file in basename:
-            score += 0.25
-
-        if "# " in content[:4] and "matches" in content[:80]:
-            score += 0.03
-        if "line=" in content_l or "char=" in content_l:
-            score += 0.03
-
-        return max(0.0, min(1.0, score))
+        return code_relevance_score(query, chunk)
 
     @staticmethod
     def _rerank_code_chunks(
         query: str, chunks: list[YAMSChunk], *, limit: int | None = None
     ) -> list[YAMSChunk]:
-        rescored: list[tuple[float, int, YAMSChunk]] = []
-        for idx, chunk in enumerate(chunks):
-            rescored.append((YAMSClient._code_relevance_score(query, chunk), idx, chunk))
-        rescored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
-        ordered = []
-        for score, _, chunk in rescored:
-            chunk.score = score
-            ordered.append(chunk)
-        if limit is not None:
-            return ordered[: max(0, int(limit))]
-        return ordered
+        return rerank_code_chunks(query, chunks, limit=limit)
 
     @staticmethod
     def _chunks_from_search_data(data: Any) -> list[YAMSChunk]:
@@ -723,15 +549,15 @@ class YAMSClient:
         for r in results:
             if not isinstance(r, dict):
                 continue
-            path = YAMSClient._get_str(r, "path")
-            h = YAMSClient._get_str(r, "hash")
-            rid = YAMSClient._get_str(r, "id")
+            path = get_str(r, "path")
+            h = get_str(r, "hash")
+            rid = get_str(r, "id")
             chunk_id: str = h or rid or path
             if not chunk_id:
                 chunk_id = json.dumps(r, ensure_ascii=True)
-            snippet = YAMSClient._get_str(r, "snippet")
-            title = YAMSClient._get_str(r, "title")
-            source = YAMSClient._normalize_search_source(path, snippet, title)
+            snippet = get_str(r, "snippet")
+            title = get_str(r, "title")
+            source = normalize_search_source(path, snippet, title)
             meta = {k: v for k, v in r.items() if k not in {"snippet", "score"}}
 
             # Search anchor metadata (if MCP provides line/char spans).
@@ -783,9 +609,9 @@ class YAMSClient:
                 continue
             if not isinstance(d, dict):
                 continue
-            h = YAMSClient._get_str(d, "hash")
-            path = YAMSClient._get_str(d, "path")
-            name = YAMSClient._get_str(d, "name")
+            h = get_str(d, "hash")
+            path = get_str(d, "path")
+            name = get_str(d, "name")
             chunk_id: str = h or path or name
             if not chunk_id:
                 chunk_id = json.dumps(d, ensure_ascii=True)
@@ -797,73 +623,7 @@ class YAMSClient:
 
     @staticmethod
     def _parse_grep_file_paths(data: Any) -> list[tuple[str, int]]:
-        """Extract unique file paths with match counts from YAMS grep output.
-
-        Returns a list of (path, match_count) tuples sorted by match count
-        descending so files with more matches (more relevant) come first.
-
-        YAMS grep output format:
-            /path/to/file.cpp (15 matches) [cpp]
-              0: [R] line content here
-        """
-        if not isinstance(data, dict):
-            return []
-
-        # Prefer structured matches[] when available.
-        structured = YAMSClient._structured_grep_matches(data)
-        if structured:
-            entries: list[tuple[str, int]] = []
-            for path, matches in structured.items():
-                first = matches[0] if matches else {}
-                raw_count = first.get("file_matches") if isinstance(first, dict) else None
-                try:
-                    count = int(raw_count) if raw_count is not None else len(matches)
-                except Exception:
-                    count = len(matches)
-                entries.append((path, max(1, count)))
-            entries.sort(key=lambda e: e[1], reverse=True)
-            return entries
-
-        output = data.get("output")
-        if not isinstance(output, str) or not output.strip():
-            return []
-
-        _HEADER_RE = _re.compile(r"^(/[^\s(]+)\s*\((\d+)\s+match", _re.MULTILINE)
-
-        seen: set[str] = set()
-        entries: list[tuple[str, int]] = []
-        skip_exts = {".json", ".lock", ".log", ".bin", ".dat"}
-
-        for m in _HEADER_RE.finditer(output):
-            path = m.group(1)
-            count = int(m.group(2))
-            if path in seen:
-                continue
-            # Skip non-code files
-            if Path(path).suffix.lower() in skip_exts:
-                continue
-            seen.add(path)
-            entries.append((path, count))
-
-        # If no header-style matches found, fall back to colon-delimited parsing
-        if not entries:
-            for ln in output.splitlines():
-                ln = ln.strip()
-                if not ln or ":" not in ln:
-                    continue
-                path = ln.split(":", 1)[0]
-                if not path or path in seen:
-                    continue
-                if not (path.startswith("/") or path.startswith(".")):
-                    continue
-                if Path(path).suffix.lower() in skip_exts:
-                    continue
-                seen.add(path)
-                entries.append((path, 1))
-
-        # Sort by match count descending — files with more matches are more relevant
-        entries.sort(key=lambda e: e[1], reverse=True)
-        return entries
+        return parse_grep_file_paths(data)
 
     @staticmethod
     def _source_matches_filters(
@@ -874,73 +634,17 @@ class YAMSClient:
         include_hints: list[str] | None = None,
         exclude_hints: list[str] | None = None,
     ) -> bool:
-        src = (source or "").strip()
-        if not src:
-            return False
-
-        src_l = src.lower()
-        cwd_norm = str(cwd or "").strip()
-        if cwd_norm:
-            try:
-                src_abs = str(Path(src).resolve())
-                cwd_abs = str(Path(cwd_norm).resolve())
-                if not src_abs.startswith(cwd_abs):
-                    return False
-            except Exception:
-                if cwd_norm not in src:
-                    return False
-
-        if path_hint:
-            hint = path_hint.strip().strip("\"'")
-            if hint:
-                hint_l = hint.lower()
-                if "/" in hint or "\\" in hint or "." in hint:
-                    if hint_l not in src_l:
-                        return False
-                elif Path(src).name.lower() != hint_l:
-                    return False
-
-        for h in include_hints or []:
-            hh = (h or "").strip()
-            if not hh:
-                continue
-            hh_l = hh.lower()
-            if any(ch in hh for ch in "*?[]"):
-                if not fnmatch.fnmatch(src_l, hh_l):
-                    return False
-            elif hh_l not in src_l:
-                return False
-
-        for h in exclude_hints or []:
-            hh = (h or "").strip()
-            if not hh:
-                continue
-            hh_l = hh.lower()
-            if any(ch in hh for ch in "*?[]"):
-                if fnmatch.fnmatch(src_l, hh_l):
-                    return False
-            elif hh_l in src_l:
-                return False
-
-        return True
+        return source_matches_filters(
+            source,
+            cwd=cwd,
+            path_hint=path_hint,
+            include_hints=include_hints,
+            exclude_hints=exclude_hints,
+        )
 
     @staticmethod
     def _structured_grep_matches(data: Any) -> dict[str, list[dict[str, Any]]]:
-        if not isinstance(data, dict):
-            return {}
-        raw = data.get("matches")
-        if not isinstance(raw, list):
-            return {}
-
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            path = YAMSClient._get_str(item, "file")
-            if not path:
-                continue
-            grouped.setdefault(path, []).append(item)
-        return grouped
+        return structured_grep_matches(data)
 
     @staticmethod
     def _read_file_context(
@@ -951,76 +655,13 @@ class YAMSClient:
         max_matches: int = 10,
         max_chars: int = 4000,
     ) -> str | None:
-        """Read a file from disk and extract context windows around pattern matches.
-
-        Returns a formatted string with match regions, or None if the file
-        can't be read or the pattern doesn't match.
-        """
-        fpath = Path(filepath)
-        if not fpath.is_file():
-            return None
-        try:
-            text = fpath.read_text(encoding="utf-8", errors="replace")
-        except (OSError, PermissionError):
-            return None
-
-        lines = text.splitlines()
-        if not lines:
-            return None
-
-        # Find matching line numbers
-        try:
-            pat = _re.compile(pattern, _re.IGNORECASE)
-        except _re.error:
-            # Fall back to literal substring search
-            pat = None
-
-        match_line_nums: list[int] = []
-        for i, line in enumerate(lines):
-            if pat is not None:
-                if pat.search(line):
-                    match_line_nums.append(i)
-            elif pattern.lower() in line.lower():
-                match_line_nums.append(i)
-            if len(match_line_nums) >= max_matches:
-                break
-
-        if not match_line_nums:
-            return None
-
-        # Build context windows, merging overlapping regions
-        regions: list[tuple[int, int]] = []
-        for lno in match_line_nums:
-            start = max(0, lno - context_lines)
-            end = min(len(lines), lno + context_lines + 1)
-            if regions and start <= regions[-1][1]:
-                # Merge with previous region
-                regions[-1] = (regions[-1][0], end)
-            else:
-                regions.append((start, end))
-
-        # Format output with line numbers
-        parts: list[str] = []
-        total_chars = 0
-        for start, end in regions:
-            region_lines: list[str] = []
-            for i in range(start, end):
-                numbered = f"{i + 1:>5}: {lines[i]}"
-                region_lines.append(numbered)
-            region_text = "\n".join(region_lines)
-            total_chars += len(region_text)
-            if total_chars > max_chars:
-                # Truncate this region to fit budget
-                remaining = max_chars - (total_chars - len(region_text))
-                if remaining > 100:
-                    parts.append(region_text[:remaining] + "\n  ... [truncated]")
-                break
-            parts.append(region_text)
-
-        if not parts:
-            return None
-
-        return "\n  ---\n".join(parts)
+        return read_file_context(
+            filepath,
+            pattern,
+            context_lines=context_lines,
+            max_matches=max_matches,
+            max_chars=max_chars,
+        )
 
     @staticmethod
     def _enrich_grep_results(
@@ -1035,121 +676,17 @@ class YAMSClient:
         context_lines: int = 10,
         max_chars_per_file: int = 4000,
     ) -> list[YAMSChunk]:
-        """Parse grep output, read matched files from disk, return enriched chunks.
-
-        Each chunk contains actual code context around match regions, not just
-        file paths.  Falls back to path-only chunks for files that can't be read.
-        Files are sorted by match count descending so the most relevant files
-        (with the most matches) are processed first.
-        """
-        structured = YAMSClient._structured_grep_matches(data)
-        if structured:
-            return YAMSClient._chunks_from_structured_grep_matches(
-                structured,
-                pattern,
-                cwd=cwd,
-                path_hint=path_hint,
-                include_hints=include_hints,
-                exclude_hints=exclude_hints,
-                max_files=max_files,
-                context_lines=context_lines,
-                max_chars_per_file=max_chars_per_file,
-            )
-
-        file_entries = YAMSClient._parse_grep_file_paths(data)
-        if not file_entries:
-            return []
-
-        if path_hint:
-            hint = path_hint.strip()
-            if hint:
-                if "/" in hint:
-                    filtered = [e for e in file_entries if hint in e[0]]
-                else:
-                    filtered = [e for e in file_entries if Path(e[0]).name == hint]
-                if filtered:
-                    file_entries = filtered
-
-        file_entries = [
-            e
-            for e in file_entries
-            if YAMSClient._source_matches_filters(
-                e[0],
-                cwd=cwd,
-                path_hint=path_hint,
-                include_hints=include_hints,
-                exclude_hints=exclude_hints,
-            )
-        ]
-
-        match_count = data.get("match_count", 0) if isinstance(data, dict) else 0
-        file_count = data.get("file_count", 0) if isinstance(data, dict) else 0
-        pattern_tag = hashlib.md5((pattern or "").encode("utf-8")).hexdigest()[:8]
-
-        chunks: list[YAMSChunk] = []
-        pat_lower = (pattern or "").lower()
-        tuned_context_lines = context_lines
-        tuned_max_chars = max_chars_per_file
-        tuned_max_matches = 10
-        if "registertool" in pat_lower:
-            tuned_context_lines = 1
-            tuned_max_chars = 8000
-            tuned_max_matches = 24
-
-        for i, (fpath, fmatches) in enumerate(file_entries[:max_files]):
-            context = YAMSClient._read_file_context(
-                fpath,
-                pattern,
-                context_lines=tuned_context_lines,
-                max_matches=tuned_max_matches,
-                max_chars=tuned_max_chars,
-            )
-            # Score higher for files with more matches
-            base_score = (
-                min(1.0, 0.3 + (fmatches / max(1, match_count)) * 0.7) if match_count else 1.0
-            )
-            if context:
-                # Rich chunk with actual code context
-                header = f"# {fpath} ({fmatches} matches)\n"
-                content = header + context
-                chunks.append(
-                    YAMSChunk(
-                        chunk_id=f"grep:{i}:{Path(fpath).name}:{pattern_tag}",
-                        content=content,
-                        score=base_score,
-                        source=fpath,
-                        metadata={
-                            "match_count": match_count,
-                            "file_count": file_count,
-                            "file_matches": fmatches,
-                            "enriched": True,
-                        },
-                    )
-                )
-                logger.debug(
-                    "grep enriched %s: %d matches, %d chars of context",
-                    fpath,
-                    fmatches,
-                    len(content),
-                )
-            else:
-                # Fallback: path-only chunk (file not on disk or pattern mismatch)
-                chunks.append(
-                    YAMSChunk(
-                        chunk_id=f"grep:{i}:{Path(fpath).name}:{pattern_tag}",
-                        content=f"[file: {fpath}]",
-                        score=0.3,  # lower score for path-only
-                        source=fpath,
-                        metadata={
-                            "match_count": match_count,
-                            "file_count": file_count,
-                            "enriched": False,
-                        },
-                    )
-                )
-                logger.debug("grep fallback (path only) %s", fpath)
-
-        return chunks
+        return enrich_grep_results(
+            data,
+            pattern,
+            cwd=cwd,
+            path_hint=path_hint,
+            include_hints=include_hints,
+            exclude_hints=exclude_hints,
+            max_files=max_files,
+            context_lines=context_lines,
+            max_chars_per_file=max_chars_per_file,
+        )
 
     @staticmethod
     def _chunks_from_structured_grep_matches(
@@ -1164,147 +701,17 @@ class YAMSClient:
         context_lines: int = 10,
         max_chars_per_file: int = 4000,
     ) -> list[YAMSChunk]:
-        if not grouped_matches:
-            return []
-
-        entries: list[tuple[str, int]] = []
-        for path, matches in grouped_matches.items():
-            first = matches[0] if matches else {}
-            raw_count = first.get("file_matches") if isinstance(first, dict) else None
-            try:
-                count = int(raw_count) if raw_count is not None else len(matches)
-            except Exception:
-                count = len(matches)
-            entries.append((path, max(1, count)))
-
-        if path_hint:
-            hint = path_hint.strip()
-            if hint:
-                if "/" in hint:
-                    entries = [e for e in entries if hint in e[0]]
-                else:
-                    entries = [e for e in entries if Path(e[0]).name == hint]
-
-        entries = [
-            e
-            for e in entries
-            if YAMSClient._source_matches_filters(
-                e[0],
-                cwd=cwd,
-                path_hint=path_hint,
-                include_hints=include_hints,
-                exclude_hints=exclude_hints,
-            )
-        ]
-
-        entries.sort(key=lambda e: e[1], reverse=True)
-        if not entries:
-            return []
-
-        pattern_tag = hashlib.md5((pattern or "").encode("utf-8")).hexdigest()[:8]
-        chunks: list[YAMSChunk] = []
-        pat_terms = [t.lower() for t in _re.findall(r"[A-Za-z0-9_]+", pattern or "") if len(t) >= 3]
-
-        for i, (fpath, fmatches) in enumerate(entries[:max_files]):
-            matches = grouped_matches.get(fpath, [])
-            rendered: list[str] = []
-            total_chars = 0
-            has_structured_context = False
-
-            for m in matches:
-                line_text = YAMSClient._get_str(m, "line_text")
-                before = (
-                    m.get("context_before") if isinstance(m.get("context_before"), list) else []
-                )
-                after = m.get("context_after") if isinstance(m.get("context_after"), list) else []
-                try:
-                    lno = int(m.get("line_number") or 0)
-                except Exception:
-                    lno = 0
-                if line_text.strip() or before or after or lno > 0:
-                    has_structured_context = True
-                    break
-
-            if has_structured_context:
-                for m in matches:
-                    try:
-                        lno = int(m.get("line_number") or 0)
-                    except Exception:
-                        lno = 0
-                    line_text = YAMSClient._get_str(m, "line_text")
-                    before = (
-                        m.get("context_before") if isinstance(m.get("context_before"), list) else []
-                    )
-                    after = (
-                        m.get("context_after") if isinstance(m.get("context_after"), list) else []
-                    )
-
-                    if not (line_text.strip() or before or after or lno > 0):
-                        continue
-
-                    if before:
-                        for b in before[-context_lines:]:
-                            rendered.append(f"      {str(b)}")
-
-                    if lno > 0:
-                        rendered.append(f"{lno:>5}: {line_text}")
-                    else:
-                        rendered.append(f"      {line_text}")
-
-                    if after:
-                        for a in after[:context_lines]:
-                            rendered.append(f"      {str(a)}")
-
-                    rendered.append("  ---")
-                    total_chars = sum(len(x) + 1 for x in rendered)
-                    if total_chars >= max_chars_per_file:
-                        break
-            else:
-                fallback_ctx = YAMSClient._read_file_context(
-                    fpath,
-                    pattern,
-                    context_lines=context_lines,
-                    max_matches=20,
-                    max_chars=max_chars_per_file,
-                )
-                if fallback_ctx:
-                    rendered = fallback_ctx.splitlines()
-
-            if rendered and rendered[-1] == "  ---":
-                rendered.pop()
-
-            body = "\n".join(rendered)
-            if len(body) > max_chars_per_file:
-                body = body[:max_chars_per_file] + "\n  ... [truncated]"
-
-            # Signal quality: prefer files where matched lines include query terms.
-            term_hits = 0
-            term_total = max(1, len(pat_terms))
-            if pat_terms:
-                lower_body = body.lower()
-                term_hits = sum(1 for t in pat_terms if t in lower_body)
-            completeness = min(1.0, (term_hits / term_total) if pat_terms else 0.6)
-            score = min(1.0, 0.25 + min(0.55, fmatches / 20.0) + (0.20 * completeness))
-
-            header = f"# {fpath} ({fmatches} matches)\n"
-            content = header + body if body else header
-            chunks.append(
-                YAMSChunk(
-                    chunk_id=f"grep:{i}:{Path(fpath).name}:{pattern_tag}",
-                    content=content,
-                    score=score,
-                    source=fpath,
-                    metadata={
-                        "file_matches": fmatches,
-                        "term_hits": term_hits,
-                        "term_total": term_total,
-                        "enriched": True,
-                        "structured": True,
-                    },
-                )
-            )
-
-        return chunks
+        return chunks_from_structured_grep_matches(
+            grouped_matches,
+            pattern,
+            cwd=cwd,
+            path_hint=path_hint,
+            include_hints=include_hints,
+            exclude_hints=exclude_hints,
+            max_files=max_files,
+            context_lines=context_lines,
+            max_chars_per_file=max_chars_per_file,
+        )
 
     @staticmethod
     def _single_chunk_json(kind: str, data: Any) -> list[YAMSChunk]:
@@ -1336,9 +743,9 @@ class YAMSClient:
             src = (c.source or "").strip()
             src_l = src.lower()
             if src:
-                if _is_code_source(src):
+                if is_code_source(src):
                     code_ratio += 1.0
-                if _is_noise_source(src):
+                if is_noise_source(src):
                     noise_ratio += 1.0
                 if q_file and q_file in src_l:
                     file_match_bonus = 0.15
@@ -1381,7 +788,7 @@ class YAMSClient:
             run_args["type"] = t
             try:
                 tool_result = await self._call_tool("search", run_args)
-                data = self._extract_tool_data(tool_result)
+                data = extract_tool_data(tool_result)
                 chunks = self._chunks_from_search_data(data)
                 # Filter out obvious out-of-scope files early.
                 chunks = [
@@ -1390,7 +797,7 @@ class YAMSClient:
                     if not c.source or self._source_matches_filters(c.source, cwd=self._cwd)
                 ]
                 self._backfill_positional_scores(chunks)
-                chunks = self._rerank_code_chunks(query, chunks, limit=limit)
+                chunks = rerank_code_chunks(query, chunks, limit=limit)
                 q = self._search_result_quality(chunks, query)
                 candidates.append((q, t, chunks))
 
@@ -1413,7 +820,7 @@ class YAMSClient:
                         if not c.source or self._source_matches_filters(c.source, cwd=self._cwd)
                     ]
                     self._backfill_positional_scores(chunks)
-                    chunks = self._rerank_code_chunks(query, chunks, limit=limit)
+                    chunks = rerank_code_chunks(query, chunks, limit=limit)
                     q = self._search_result_quality(chunks, query)
                     candidates.append((q, f"cli:{t}", chunks))
                     if not requested_type and t == "hybrid":
@@ -1455,7 +862,7 @@ class YAMSClient:
         args.update(kwargs)
         try:
             tool_result = await self._call_tool("grep", args)
-            data = self._extract_tool_data(tool_result)
+            data = extract_tool_data(tool_result)
         except Exception:
             data = await self._cli_json(
                 ["grep", pat, "--json"], timeout_s=max(30.0, self._request_timeout_s)
@@ -1471,7 +878,7 @@ class YAMSClient:
         # Assign positional scores so the assembler can rank earlier
         # (more relevant) matches higher.
         self._backfill_positional_scores(chunks)
-        return self._rerank_code_chunks(pattern, chunks)
+        return rerank_code_chunks(pattern, chunks)
 
     @staticmethod
     def _split_grep_pattern(pattern: str) -> tuple[str, str | None, list[str], list[str]]:
@@ -1603,9 +1010,9 @@ class YAMSClient:
         for i, n in enumerate(nodes):
             if not isinstance(n, dict):
                 continue
-            label = YAMSClient._get_str(n, "label")
-            ntype = YAMSClient._get_str(n, "type")
-            nkey = YAMSClient._get_str(n, "nodeKey")
+            label = get_str(n, "label")
+            ntype = get_str(n, "type")
+            nkey = get_str(n, "nodeKey")
             dist = n.get("distance")
             if isinstance(dist, int):
                 d = max(0, dist)
@@ -1652,7 +1059,7 @@ class YAMSClient:
         Returns the raw structured data dict from the tool response.
         """
         tool_result = await self._call_tool("graph", kwargs)
-        data = self._extract_tool_data(tool_result)
+        data = extract_tool_data(tool_result)
         if isinstance(data, dict):
             return data
         return {"raw": data}
@@ -1681,13 +1088,13 @@ class YAMSClient:
                 "get", name_args() if try_hash_first else hash_args()
             )
 
-        data = self._extract_tool_data(tool_result)
+        data = extract_tool_data(tool_result)
         if not isinstance(data, dict):
             return None
-        content: str = self._get_str(data, "content")
-        h = self._get_str(data, "hash")
-        path = self._get_str(data, "path")
-        name = self._get_str(data, "name")
+        content: str = get_str(data, "content")
+        h = get_str(data, "hash")
+        path = get_str(data, "path")
+        name = get_str(data, "name")
         chunk_id: str = h or path or name or q
         source: str = path
         return YAMSChunk(
@@ -1696,7 +1103,7 @@ class YAMSClient:
 
     async def list_docs(self, **kwargs: Any) -> list[YAMSChunk]:
         tool_result = await self._call_tool("list", kwargs)
-        data = self._extract_tool_data(tool_result)
+        data = extract_tool_data(tool_result)
         return self._chunks_from_list_data(data)
 
     async def add(
@@ -1713,7 +1120,7 @@ class YAMSClient:
             args["metadata"] = metadata
 
         tool_result = await self._call_tool("add", args)
-        data = self._extract_tool_data(tool_result)
+        data = extract_tool_data(tool_result)
         if isinstance(data, dict) and isinstance(data.get("hash"), str) and data["hash"]:
             return data["hash"]
         raise YAMSProtocolError(f"add: unexpected response: {data}")
@@ -1721,7 +1128,7 @@ class YAMSClient:
     async def status(self) -> dict[str, Any]:
         try:
             tool_result = await self._call_tool("status", {})
-            data = self._extract_tool_data(tool_result)
+            data = extract_tool_data(tool_result)
         except Exception:
             data = await self._cli_json(
                 ["status", "--json"], timeout_s=max(30.0, self._request_timeout_s)
@@ -1742,7 +1149,7 @@ class YAMSClient:
         if await self.has_tool("query"):
             try:
                 tool_result = await self._call_tool("query", {"steps": steps})
-                data = self._extract_tool_data(tool_result)
+                data = extract_tool_data(tool_result)
                 return self._pipeline_results_from_query_data(data)
             except YAMSProtocolError as e:
                 msg = str(e)
@@ -1778,7 +1185,7 @@ class YAMSClient:
                 params = {}
             params = self._resolve_prev_refs(params, prev)
             tool_result = await self._call_tool(str(op), params)
-            prev = self._extract_tool_data(tool_result)
+            prev = extract_tool_data(tool_result)
             results.append(prev)
         return results
 

@@ -1,4 +1,6 @@
-# Agent Architecture V2 (Reliability + Usefulness)
+# Agent Architecture V2 (Design Direction)
+
+This document describes the intended architecture direction for DCS. It is not a guarantee that every component described here already exists in the current implementation.
 
 ## Why this revision
 

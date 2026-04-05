@@ -46,6 +46,11 @@ def _now_ms() -> float:
     return time.perf_counter() * 1000.0
 
 
+def _is_lmstudio_backend(base_url: str) -> bool:
+    raw = str(base_url or "").lower()
+    return "127.0.0.1:8080" not in raw and "/api/v1" not in raw and "localhost:1234" in raw
+
+
 def _clamp01(x: float) -> float:
     if x < 0.0:
         return 0.0
@@ -127,7 +132,7 @@ class DCSPipeline:
     def _reconcile_model_context_window(self, model_cfg) -> tuple[int, int]:
         requested = int(getattr(model_cfg, "context_window", 0) or 0)
         actual = requested
-        if lmstudio_available():
+        if lmstudio_available() and _is_lmstudio_backend(getattr(model_cfg, "base_url", "")):
             try:
                 detected = get_context_length(str(model_cfg.name or ""))
                 if detected and int(detected) > 0:
@@ -635,7 +640,9 @@ class DCSPipeline:
                         context = self._prepend_codemap(context, codemap_prefix, codemap_tokens)
 
                         # Ensure prompt fits the actual LM Studio context length when available.
-                        if lmstudio_available():
+                        if lmstudio_available() and _is_lmstudio_backend(
+                            getattr(self.config.executor_model, "base_url", "")
+                        ):
                             max_ctx = get_context_length(self.config.executor_model.name)
                             if max_ctx:
                                 target = int(max_ctx * 0.9)

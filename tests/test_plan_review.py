@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dcs.plan_review import (
+    PlanReviewer,
     _counts_for_coverage,
     _looks_like_rich_plan_prompt,
-    PlanReviewer,
     build_change_summary,
     parse_plan_steps,
 )

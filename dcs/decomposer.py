@@ -8,6 +8,7 @@ import re
 from dataclasses import asdict
 from typing import Any
 
+from dcs.shared import clamp01, spec_key
 from dcs.types import Critique, ModelConfig, QuerySpec, QueryType
 
 logger = logging.getLogger(__name__)
@@ -16,18 +17,6 @@ logger = logging.getLogger(__name__)
 _PATH_RE = re.compile(r"(?P<path>(?:[A-Za-z]:\\)?(?:\.?\.?/)?[\w.\-~/]+(?:/[\w.\-]+)+)")
 _PY_SYMBOL_RE = re.compile(r"\b(?:(?:class|def)\s+)?([A-Za-z_][A-Za-z0-9_]*)\b")
 _ERROR_RE = re.compile(r"(?i)\b(?:traceback|exception|error|failed|assert(?:ion)?\s+error|panic)\b")
-
-
-def _clamp01(x: float) -> float:
-    if x < 0.0:
-        return 0.0
-    if x > 1.0:
-        return 1.0
-    return x
-
-
-def _spec_key(spec: QuerySpec) -> tuple[str, str]:
-    return (spec.query_type.value, spec.query.strip())
 
 
 class TaskDecomposer:
@@ -89,7 +78,7 @@ class TaskDecomposer:
         if not task:
             return []
 
-        tried = {_spec_key(s) for s in (previous_specs or [])}
+        tried = {spec_key(s) for s in (previous_specs or [])}
 
         # If critique is empty, do not spin cycles.
         if not (critique.missing_info or critique.suggested_queries):
@@ -165,7 +154,7 @@ class TaskDecomposer:
         out: list[QuerySpec] = []
         seen = set(tried)
         for spec in specs:
-            key = _spec_key(spec)
+            key = spec_key(spec)
             if key in seen:
                 logger.debug(
                     "refine: skipping duplicate spec: %s %r", spec.query_type.value, spec.query
@@ -539,10 +528,10 @@ class TaskDecomposer:
                 ]
             )
 
-        existing = {_spec_key(s) for s in specs}
+        existing = {spec_key(s) for s in specs}
         out: list[QuerySpec] = []
         for s in seeded:
-            key = _spec_key(s)
+            key = spec_key(s)
             if key in existing:
                 continue
             existing.add(key)
@@ -629,7 +618,7 @@ class TaskDecomposer:
                 QuerySpec(
                     query=s.query,
                     query_type=s.query_type,
-                    importance=_clamp01(float(s.importance) * mul),
+                    importance=clamp01(float(s.importance) * mul),
                     reason=s.reason,
                 )
             )
@@ -847,7 +836,7 @@ class TaskDecomposer:
         return QuerySpec(
             query=query,
             query_type=query_type,
-            importance=_clamp01(importance),
+            importance=clamp01(importance),
             reason=reason,
         )
 
@@ -855,13 +844,13 @@ class TaskDecomposer:
         # Deduplicate and clamp; keep highest-importance duplicates.
         best: dict[tuple[str, str], QuerySpec] = {}
         for s in specs:
-            key = _spec_key(s)
+            key = spec_key(s)
             prev = best.get(key)
             if prev is None or s.importance > prev.importance:
                 best[key] = QuerySpec(
                     query=s.query.strip(),
                     query_type=s.query_type,
-                    importance=_clamp01(float(s.importance)),
+                    importance=clamp01(float(s.importance)),
                     reason=s.reason or "",
                 )
 
@@ -1292,7 +1281,7 @@ class TaskDecomposer:
                 importance=0.95,
                 reason="path mentioned in task",
             )
-            key = _spec_key(spec)
+            key = spec_key(spec)
             if key in seen:
                 continue
             seen.add(key)
@@ -1311,7 +1300,7 @@ class TaskDecomposer:
                     importance=0.8,
                     reason="error/pattern mentioned in task",
                 )
-                key = _spec_key(spec)
+                key = spec_key(spec)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -1333,7 +1322,7 @@ class TaskDecomposer:
                 importance=0.7,
                 reason="symbol mentioned in task",
             )
-            key = _spec_key(spec)
+            key = spec_key(spec)
             if key in seen:
                 continue
             seen.add(key)
@@ -1346,7 +1335,7 @@ class TaskDecomposer:
             importance=0.6,
             reason="general task description",
         )
-        key = _spec_key(spec)
+        key = spec_key(spec)
         if key not in seen:
             specs.append(spec)
 

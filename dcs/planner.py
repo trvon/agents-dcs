@@ -12,6 +12,7 @@ try:  # optional dependency
 except Exception:  # pragma: no cover
     dspy = None  # type: ignore[assignment]
 
+from dcs.shared import is_noise_source, spec_key
 from dcs.types import QuerySpec, QueryType, YAMSChunk, YAMSQueryResult
 
 logger = logging.getLogger(__name__)
@@ -76,10 +77,6 @@ _PATH_STOP_TERMS = {
 }
 
 
-def _spec_key(spec: QuerySpec) -> tuple[str, str]:
-    return (spec.query_type.value, spec.query.strip())
-
-
 def _dedupe_chunks(chunks: list[YAMSChunk]) -> list[YAMSChunk]:
     seen: set[str] = set()
     out: list[YAMSChunk] = []
@@ -90,15 +87,6 @@ def _dedupe_chunks(chunks: list[YAMSChunk]) -> list[YAMSChunk]:
         seen.add(cid)
         out.append(c)
     return out
-
-
-def _is_noise_source(path: str) -> bool:
-    p = (path or "").lower()
-    if not p:
-        return False
-    if "/tests/" in p or "/docs/" in p or "/benchmarks/" in p:
-        return True
-    return p.endswith((".md", ".txt", ".json", ".yaml", ".yml", ".lock"))
 
 
 class QueryPlanner:
@@ -351,7 +339,7 @@ class QueryPlanner:
         all_results = list(primary)
 
         # Breadth-first expansion driven by result contents.
-        visited_specs = {_spec_key(r.spec) for r in all_results}
+        visited_specs = {spec_key(r.spec) for r in all_results}
         frontier = list(primary)
 
         for hop in range(1, depth + 1):
@@ -362,7 +350,7 @@ class QueryPlanner:
                 follow_specs.extend(self._followups_from_result(res, hop=hop))
 
             follow_specs = [
-                s for s in self._dedupe_specs(follow_specs) if _spec_key(s) not in visited_specs
+                s for s in self._dedupe_specs(follow_specs) if spec_key(s) not in visited_specs
             ]
             if not follow_specs:
                 break
@@ -370,7 +358,7 @@ class QueryPlanner:
             logger.debug("multihop hop=%d follow_specs=%d", hop, len(follow_specs))
             follow_results = await self.execute(follow_specs)
             for r in follow_results:
-                visited_specs.add(_spec_key(r.spec))
+                visited_specs.add(spec_key(r.spec))
 
             all_results.extend(follow_results)
             frontier = follow_results
@@ -447,8 +435,8 @@ class QueryPlanner:
             pred = None
             for adapter in self._dspy_adapters():
 
-                def _run() -> Any:
-                    with dspy.context(lm=self._dspy_rerank_model, adapter=adapter):
+                def _run(current_adapter: Any = adapter) -> Any:
+                    with dspy.context(lm=self._dspy_rerank_model, adapter=current_adapter):
                         predictor = self._dspy_rerank_predictor
                         if predictor is None:
                             predictor = dspy.Predict(sig)
@@ -527,7 +515,7 @@ class QueryPlanner:
                 hits = sum(1 for t in q_terms if t in txt_l or t in src_l)
                 score += min(0.15, 0.03 * hits)
 
-            if not mentions_tests and _is_noise_source(src_l):
+            if not mentions_tests and is_noise_source(src_l):
                 score *= 0.70
 
             c.score = max(0.0, min(1.0, score))
@@ -543,7 +531,7 @@ class QueryPlanner:
         for s in specs or []:
             if not s or not s.query.strip():
                 continue
-            key = _spec_key(s)
+            key = spec_key(s)
             if key in seen:
                 continue
             seen.add(key)
@@ -642,7 +630,7 @@ class QueryPlanner:
 
     def _anchor_confidence(self, spec: QuerySpec, chunk: YAMSChunk) -> float:
         path = self._path_from_chunk(chunk)
-        if not path or _is_noise_source(path):
+        if not path or is_noise_source(path):
             return 0.0
 
         score = float(chunk.score or 0.0)
@@ -710,7 +698,7 @@ class QueryPlanner:
                 p = self._path_from_chunk(c)
                 if not p:
                     continue
-                if _is_noise_source(p):
+                if is_noise_source(p):
                     continue
                 path_parts = set(self._path_parts(p))
                 overlap = len(anchor_parts.intersection(path_parts)) if anchor_parts else 0
@@ -782,7 +770,7 @@ class QueryPlanner:
         order: list[tuple[str, str]] = []
 
         for r in results or []:
-            key = _spec_key(r.spec)
+            key = spec_key(r.spec)
             if key not in merged:
                 merged[key] = YAMSQueryResult(
                     spec=r.spec,
@@ -942,7 +930,7 @@ class QueryPlanner:
                     src = (src or "").strip()
                     if not src:
                         continue
-                    if _is_noise_source(src):
+                    if is_noise_source(src):
                         continue
                     if "/" not in src and "\\" not in src:
                         continue

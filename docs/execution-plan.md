@@ -1,4 +1,6 @@
-# DCS Execution Plan (Accuracy-First)
+# DCS Execution Plan (Roadmap)
+
+This document is the implementation roadmap for DCS accuracy and retrieval improvements. It complements the current usage docs in `README.md` and the benchmark protocol in `docs/benchmarking.md`.
 
 ## Goal
 Improve grounded accuracy and retrieval reliability while controlling paid-model spend.

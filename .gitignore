@@ -9,6 +9,7 @@ build/
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
+config.toml
 results/
 *.log
 .venv/

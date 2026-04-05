@@ -570,7 +570,7 @@ class SelfCritic:
             for cid in known:
                 alias_map[cid] = cid
                 alias_map[cid.lower()] = cid
-            for src, cid in zip(context.sources or [], context.chunk_ids or []):
+            for src, cid in zip(context.sources or [], context.chunk_ids or [], strict=False):
                 if not src or not cid:
                     continue
                 alias_map[src] = cid

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import statistics
 from pathlib import Path
 from typing import Any
@@ -100,7 +99,7 @@ def compare_models(rows: list[dict[str, Any]]) -> dict[str, Any]:
     wins = {model: 0 for model in models}
     ties = 0
     compared = 0
-    for task_id, entries in grouped.items():
+    for entries in grouped.values():
         if len(entries) < 2:
             continue
         compared += 1

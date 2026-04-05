@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dcs.types import YAMSChunk
 from dcs.client import YAMSClient
+from dcs.types import YAMSChunk
 
 
 def test_split_grep_pattern_supports_include_exclude_tokens() -> None:

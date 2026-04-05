@@ -16,8 +16,8 @@ from dcs.indexing import prime_yams_index
 from dcs.lmstudio_context import get_context_length, preload_model
 from dcs.pipeline import DCSPipeline
 from dcs.plan_review import PlanReviewer, _looks_like_rich_plan_prompt
-from dcs.runtime_config import load_runtime_settings
 from dcs.router import RoutingPolicy, TieredRouter
+from dcs.runtime_config import load_runtime_settings
 from dcs.types import (
     EvalResult,
     EvalTask,
@@ -29,6 +29,11 @@ from dcs.types import (
 )
 from eval.metrics import evaluate_task
 from eval.runner import EvalRunner
+
+
+def _is_lmstudio_backend(base_url: str) -> bool:
+    raw = str(base_url or "").lower()
+    return "127.0.0.1:8080" not in raw and "/api/v1" not in raw and "localhost:1234" in raw
 
 
 def _default_paths() -> tuple[str, str, str]:
@@ -188,6 +193,8 @@ def _preload_configs(
         if key in seen:
             continue
         seen.add(key)
+        if not _is_lmstudio_backend(cfg.base_url):
+            continue
         requested_ctx = int(cfg.context_window)
         ok = preload_model(
             cfg.name,

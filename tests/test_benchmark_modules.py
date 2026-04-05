@@ -9,6 +9,7 @@ import pytest
 from benchmarks import coverage_benchmark as cov_bench
 from benchmarks import report_benchmark as report_bench
 from benchmarks import retrieval_benchmark as ret_bench
+from dcs import pipeline as pipe_mod
 from dcs.types import (
     ContextBlock,
     Critique,
@@ -62,6 +63,8 @@ models:
     )
     assert raw.name == "qwen/qwen3-coder-next"
     assert raw.temperature == 1.0
+    assert cov_bench._is_lmstudio_backend("http://localhost:1234/v1") is True
+    assert cov_bench._is_lmstudio_backend("http://127.0.0.1:8080/v1") is False
 
     payload = {"k": [{"task_id": "x", "passed": True}]}
     ckpt = tmp_path / "ckpt.json"
@@ -145,9 +148,9 @@ def test_coverage_preload_configs_deduplicates(monkeypatch: pytest.MonkeyPatch) 
     )
     monkeypatch.setattr(cov_bench, "get_context_length", lambda name: 32768)
 
-    c1 = ModelConfig(name="m1", base_url="u", api_key="k")
-    c2 = ModelConfig(name="m1", base_url="u", api_key="k")
-    c3 = ModelConfig(name="m2", base_url="u", api_key="k")
+    c1 = ModelConfig(name="m1", base_url="http://localhost:1234/v1", api_key="k")
+    c2 = ModelConfig(name="m1", base_url="http://localhost:1234/v1", api_key="k")
+    c3 = ModelConfig(name="m2", base_url="http://localhost:1234/v1", api_key="k")
 
     console = SimpleNamespace(print=lambda *args, **kwargs: None)
     cov_bench._preload_configs(console, [c1, c2, c3], retries=2, retry_backoff_s=1.0)
@@ -186,6 +189,8 @@ def test_pipeline_config_supports_dspy_retrieval_rerank() -> None:
     assert cfg.dspy_retrieval_max_tokens == 16384
     assert cfg.dspy_retrieval_demo_count == 4
     assert cfg.dspy_retrieval_prefer_json is True
+    assert pipe_mod._is_lmstudio_backend("http://localhost:1234/v1") is True
+    assert pipe_mod._is_lmstudio_backend("http://127.0.0.1:8080/v1") is False
 
 
 def test_retrieval_model_resolution_prefers_matching_role_and_raw_ids() -> None:

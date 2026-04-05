@@ -1,4 +1,4 @@
-"""Dynamic Context Scaffold — YAMS-backed retrieval harness for small LLM agents."""
+"""Dynamic Context Scaffold (DCS) for YAMS-backed retrieval and evaluation."""
 
 __version__ = "0.0.1"
 
